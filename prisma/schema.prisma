@@ -1,0 +1,395 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Company {
+  id           String   @id @default(uuid())
+  name         String
+  legalName    String?  @map("legal_name")
+  tinNumber    String?  @map("tin_number")
+  phone        String?
+  email        String?
+  address      String?
+  currencyCode String   @default("ETB") @map("currency_code")
+  timezone     String   @default("Africa/Addis_Ababa")
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  branches     Branch[]
+  users        User[]
+  roles        Role[]
+  products     Product[]
+  customers    Customer[]
+  suppliers    Supplier[]
+  sales        Sale[]
+  expenses     Expense[]
+
+  @@map("companies")
+}
+
+model Branch {
+  id          String   @id @default(uuid())
+  companyId   String   @map("company_id")
+  code        String   @unique
+  name        String
+  phone       String?
+  address     String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  company     Company  @relation(fields: [companyId], references: [id])
+  users       User[]
+  sales       Sale[]
+
+  @@map("branches")
+}
+
+model User {
+  id                 String   @id @default(uuid())
+  companyId          String   @map("company_id")
+  branchId           String?  @map("branch_id")
+  username           String   @unique
+  email              String?
+  passwordHash       String   @map("password_hash")
+  firstName          String   @map("first_name")
+  lastName           String   @map("last_name")
+  phone              String?
+  active             Boolean  @default(true)
+  lastLoginAt        DateTime? @map("last_login_at")
+  failedLoginAttempts Int     @default(0) @map("failed_login_attempts")
+  lockedUntil        DateTime? @map("locked_until")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  company            Company  @relation(fields: [companyId], references: [id])
+  branch             Branch?  @relation(fields: [branchId], references: [id])
+  roles              UserRole[]
+  sessions           Session[]
+  sales              Sale[]   @relation("cashier")
+
+  @@map("users")
+}
+
+model Role {
+  id          String   @id @default(uuid())
+  companyId   String   @map("company_id")
+  name        String
+  description String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  company     Company  @relation(fields: [companyId], references: [id])
+  userRoles   UserRole[]
+  permissions RolePermission[]
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String   @id @default(uuid())
+  module      String
+  action      String
+  description String?
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  roles       RolePermission[]
+
+  @@unique([module, action])
+  @@map("permissions")
+}
+
+model UserRole {
+  id        String   @id @default(uuid())
+  userId    String   @map("user_id")
+  roleId    String   @map("role_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  user      User     @relation(fields: [userId], references: [id])
+  role      Role     @relation(fields: [roleId], references: [id])
+
+  @@unique([userId, roleId])
+  @@map("user_roles")
+}
+
+model RolePermission {
+  id           String   @id @default(uuid())
+  roleId       String   @map("role_id")
+  permissionId String   @map("permission_id")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  role         Role     @relation(fields: [roleId], references: [id])
+  permission   Permission @relation(fields: [permissionId], references: [id])
+
+  @@unique([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+model Session {
+  id                String   @id @default(uuid())
+  userId            String   @map("user_id")
+  refreshTokenHash  String   @map("refresh_token_hash")
+  ipAddress         String?  @map("ip_address")
+  userAgent         String?  @map("user_agent")
+  expiresAt         DateTime @map("expires_at")
+  createdAt         DateTime @default(now()) @map("created_at")
+  revokedAt         DateTime? @map("revoked_at")
+
+  user              User     @relation(fields: [userId], references: [id])
+
+  @@map("sessions")
+}
+
+model Product {
+  id            String   @id @default(uuid())
+  companyId     String   @map("company_id")
+  categoryId    String?  @map("category_id")
+  unitId        String?  @map("unit_id")
+  sku           String   @unique
+  barcode       String?  @unique
+  name          String
+  description   String?
+  brand         String?
+  costPrice     Float    @default(0) @map("cost_price")
+  sellingPrice  Float    @default(0) @map("selling_price")
+  minimumPrice  Float?   @map("minimum_price")
+  reorderLevel  Float?   @map("reorder_level")
+  reorderQty    Float?   @map("reorder_quantity")
+  trackStock    Boolean  @default(true) @map("track_stock")
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  company       Company  @relation(fields: [companyId], references: [id])
+  category      Category? @relation(fields: [categoryId], references: [id])
+  unit          Unit?    @relation(fields: [unitId], references: [id])
+  inventory     InventoryBalance[]
+  transactions  InventoryTransaction[]
+  saleItems     SaleItem[]
+
+  @@map("products")
+}
+
+model Category {
+  id          String   @id @default(uuid())
+  companyId   String   @map("company_id")
+  name        String
+  description String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  company     Company  @relation(fields: [companyId], references: [id])
+  products    Product[]
+
+  @@map("categories")
+}
+
+model Unit {
+  id            String   @id @default(uuid())
+  name          String
+  symbol        String?
+  decimalAllowed Boolean @default(false) @map("decimal_allowed")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  products      Product[]
+
+  @@map("units")
+}
+
+model InventoryBalance {
+  id             String   @id @default(uuid())
+  warehouseId    String   @map("warehouse_id")
+  productId      String   @map("product_id")
+  quantityOnHand Float    @default(0) @map("quantity_on_hand")
+  quantityReserved Float  @default(0) @map("quantity_reserved")
+  quantityAvailable Float @default(0) @map("quantity_available")
+  averageCost    Float    @default(0) @map("average_cost")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  product        Product  @relation(fields: [productId], references: [id])
+
+  @@unique([warehouseId, productId])
+  @@map("inventory_balances")
+}
+
+model InventoryTransaction {
+  id            String   @id @default(uuid())
+  warehouseId   String   @map("warehouse_id")
+  productId     String   @map("product_id")
+  transactionType String @map("transaction_type")
+  referenceType String   @map("reference_type")
+  referenceId   String?  @map("reference_id")
+  quantity      Float
+  unitCost      Float
+  balanceAfter  Float    @map("balance_after")
+  reason        String?
+  createdBy     String?  @map("created_by")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  product       Product  @relation(fields: [productId], references: [id])
+
+  @@map("inventory_transactions")
+}
+
+model Customer {
+  id            String   @id @default(uuid())
+  companyId     String   @map("company_id")
+  customerCode  String   @unique @map("customer_code")
+  name          String
+  phone         String?
+  email         String?
+  address       String?
+  taxNumber     String?  @map("tax_number")
+  creditLimit   Float?   @map("credit_limit")
+  paymentTerms  String?  @map("payment_terms")
+  openingBalance Float   @default(0) @map("opening_balance")
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  company       Company  @relation(fields: [companyId], references: [id])
+  sales         Sale[]
+  payments      Payment[]
+
+  @@map("customers")
+}
+
+model Supplier {
+  id            String   @id @default(uuid())
+  companyId     String   @map("company_id")
+  supplierCode  String   @unique @map("supplier_code")
+  name          String
+  contactPerson String?  @map("contact_person")
+  phone         String?
+  email         String?
+  address       String?
+  taxNumber     String?  @map("tax_number")
+  paymentTerms  String?  @map("payment_terms")
+  creditLimit   Float?   @map("credit_limit")
+  openingBalance Float   @default(0) @map("opening_balance")
+  active        Boolean  @default(true)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  company       Company  @relation(fields: [companyId], references: [id])
+  expenses      Expense[]
+
+  @@map("suppliers")
+}
+
+model Sale {
+  id            String   @id @default(uuid())
+  companyId     String   @map("company_id")
+  branchId      String   @map("branch_id")
+  warehouseId   String   @map("warehouse_id")
+  customerId    String?  @map("customer_id")
+  cashierId     String?  @map("cashier_id")
+  invoiceNumber String   @unique @map("invoice_number")
+  saleDate      DateTime @map("sale_date")
+  saleTime      String?  @map("sale_time")
+  status        String   @default("Completed")
+  subtotal      Float    @default(0)
+  discount      Float    @default(0)
+  tax           Float    @default(0)
+  total         Float    @default(0)
+  amountPaid    Float    @default(0) @map("amount_paid")
+  balanceDue    Float    @default(0) @map("balance_due")
+  paymentStatus String   @default("Paid") @map("payment_status")
+  notes         String?
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  company       Company  @relation(fields: [companyId], references: [id])
+  branch        Branch   @relation(fields: [branchId], references: [id])
+  customer      Customer? @relation(fields: [customerId], references: [id])
+  cashier       User?    @relation("cashier", fields: [cashierId], references: [id])
+  items         SaleItem[]
+  payments      Payment[]
+
+  @@map("sales")
+}
+
+model SaleItem {
+  id            String   @id @default(uuid())
+  saleId        String   @map("sale_id")
+  productId     String   @map("product_id")
+  productNameSnapshot String @map("product_name_snapshot")
+  quantity      Float
+  unitPrice     Float    @map("unit_price")
+  unitCost      Float    @map("unit_cost")
+  discount      Float    @default(0)
+  tax           Float    @default(0)
+  lineTotal     Float    @map("line_total")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  sale          Sale     @relation(fields: [saleId], references: [id])
+  product       Product  @relation(fields: [productId], references: [id])
+
+  @@map("sale_items")
+}
+
+model Payment {
+  id            String   @id @default(uuid())
+  saleId        String?  @map("sale_id")
+  customerId    String?  @map("customer_id")
+  paymentMethod String   @map("payment_method")
+  amount        Float
+  referenceNumber String? @map("reference_number")
+  paymentDate   DateTime @map("payment_date")
+  cashAccountId String?  @map("cash_account_id")
+  receivedBy    String?  @map("received_by")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  sale          Sale?    @relation(fields: [saleId], references: [id])
+  customer      Customer? @relation(fields: [customerId], references: [id])
+
+  @@map("payments")
+}
+
+model ExpenseCategory {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  active      Boolean  @default(true)
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  expenses    Expense[]
+
+  @@map("expense_categories")
+}
+
+model Expense {
+  id          String   @id @default(uuid())
+  companyId   String   @map("company_id")
+  branchId    String   @map("branch_id")
+  categoryId  String?  @map("category_id")
+  expenseNumber String @unique @map("expense_number")
+  supplierId  String?  @map("supplier_id")
+  description String
+  amount      Float
+  tax         Float    @default(0)
+  paymentMethod String? @map("payment_method")
+  expenseDate DateTime @map("expense_date")
+  status      String   @default("Pending")
+  attachmentUrl String? @map("attachment_url")
+  createdBy   String?  @map("created_by")
+  approvedBy  String?  @map("approved_by")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  company     Company  @relation(fields: [companyId], references: [id])
+  branch      Branch   @relation(fields: [branchId], references: [id])
+  category    ExpenseCategory? @relation(fields: [categoryId], references: [id])
+  supplier    Supplier? @relation(fields: [supplierId], references: [id])
+
+  @@map("expenses")
+}

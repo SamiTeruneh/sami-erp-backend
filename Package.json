@@ -1,0 +1,16 @@
+{
+  "name": "sami-erp-backend",
+  "version": "1.0.0",
+  "description": "Sami Stationary ERP Backend",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "nodemailer": "^10.0.7"
+  },
+  "devDependencies": {
+    "@flydotio/dockerfile": "^0.7.10"
+  }
+}
