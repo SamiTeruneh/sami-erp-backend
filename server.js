@@ -4,7 +4,7 @@ const http = require('http');
 const url = require('url');
 const crypto = require('crypto');
 const { Pool } = require('pg');
-
+const requestOrigin = req.headers.origin;
 const PORT = process.env.PORT || 3001;
 
 // ============ DATABASE CONNECTION ============
@@ -84,15 +84,31 @@ async function sendVerificationCode(toEmail, code, userName) {
 }
 
 // ============ CORS ============
-function setCors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+function setCors(res, origin) {
+  // Allow your Firebase frontend and local development
+  const allowedOrigins = [
+    'https://sami-erp-system.web.app',
+    'https://sami-erp-system.firebaseapp.com',
+    'http://localhost:5173',
+    'http://localhost:3000'
+  ];
+
+  // If the request has an origin that is allowed, echo it back
+  if (origin && allowedOrigins.includes(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+  } else {
+    // Fallback for non-browser requests (like curl) or unexpected origins
+    // Using '*' here is safe ONLY if credentials are not used for that request
+    res.setHeader('Access-Control-Allow-Origin', '*'); 
+  }
+
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.setHeader('Access-Control-Max-Age', '86400'); // Cache preflight for 24 hours
 }
-
-function sendJson(res, status, data) {
-  setCors(res);
+function sendJson(res, status, data, origin) {
+  setCors(res, origin);
   res.writeHead(status, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify(data));
 }
@@ -208,19 +224,19 @@ const server = http.createServer(async (req, res) => {
 
   console.log(`📝 ${method} ${path}`);
 
-  if (method === 'OPTIONS') {
-    setCors(res);
-    res.writeHead(200);
-    res.end();
-    return;
-  }
+if (method === 'OPTIONS') {
+  setCors(res, requestOrigin);
+  res.writeHead(200);
+  res.end();
+  return;
+}
 
   try {
     // ============ HEALTH ============
     if (path === '/api/v1/health' && method === 'GET') {
       try {
         await query('SELECT 1');
-        return sendJson(res, 200, { status: 'ok', emailReady, database: 'connected' });
+        return sendJson(res, 200, { status: 'ok', emailReady, database: 'connected' }, requestOrigin);
       } catch (err) {
         return sendJson(res, 503, { status: 'error', database: 'disconnected', message: err.message });
       }
