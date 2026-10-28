@@ -1,9 +1,8 @@
-// server.js - SAMI ERP with PostgreSQL Backend
+// server.js - SAMI ERP (PostgreSQL + Brevo Email) - Production Ready
 require('dotenv').config();
 const http = require('http');
 const url = require('url');
 const crypto = require('crypto');
-const nodemailer = require('nodemailer');
 const { Pool } = require('pg');
 
 const PORT = process.env.PORT || 3001;
@@ -27,96 +26,59 @@ async function query(text, params) {
     return result;
   } catch (err) {
     console.error('❌ DB Query Error:', err.message);
-    console.error('   SQL:', text.substring(0, 100));
-    console.error('   Params:', params);
     throw err;
   }
 }
 
-// ============ EMAIL CONFIG ============
-const EMAIL_CONFIG = {
-  service: 'gmail',
-  auth: {
-    user: process.env.EMAIL_USER || 'samsonteruneh@gmail.com',
-    pass: process.env.EMAIL_PASS || 'nwdtvusatxwcfphq'
-  }
-};
+// ============ EMAIL (Brevo HTTPS API) ============
+let emailReady = !!(process.env.BREVO_API_KEY);
+if (emailReady) console.log('✅ Brevo email configured');
+else console.log('⚠️  BREVO_API_KEY not set');
 
-let transporter = null;
-let emailReady = false;
-
-try {
-  transporter = nodemailer.createTransport(EMAIL_CONFIG);
-  transporter.verify((error) => {
-    if (error) {
-      console.error('❌ Email service error:', error.message);
-      emailReady = false;
-    } else {
-      console.log('✅ Email service ready');
-      emailReady = true;
-    }
-  });
-} catch (err) {
-  console.error('❌ Failed to initialize email:', err.message);
-}
-
-// ============ PASSWORD RESET CODES (in-memory) ============
+// ============ PASSWORD RESET CODES ============
 const passwordResetCodes = {};
 
-// ============ EMAIL FUNCTION ============
 async function sendVerificationCode(toEmail, code, userName) {
-  if (!transporter || !emailReady) {
-    console.log('⚠️  Email not configured. Code:', code);
+  const BREVO_API_KEY = process.env.BREVO_API_KEY;
+  if (!BREVO_API_KEY) {
+    console.log('⚠️  Code (dev):', code);
     return { success: false, error: 'Email not configured', code };
   }
 
-  const mailOptions = {
-    from: `"SAMI ERP" <${EMAIL_CONFIG.auth.user}>`,
-    to: toEmail,
-    subject: '🔐 Password Reset Code - SAMI ERP',
-    html: `
-      <!DOCTYPE html>
-      <html>
-      <head>
-        <style>
-          body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #f3f4f6; padding: 20px; margin: 0; }
-          .container { max-width: 500px; margin: 0 auto; background: white; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 20px rgba(0,0,0,0.1); }
-          .header { background: linear-gradient(135deg, #3B82F6, #1E40AF); padding: 30px; text-align: center; color: white; }
-          .header h1 { margin: 0; font-size: 28px; }
-          .body { padding: 30px; }
-          .code-box { background: #EFF6FF; border: 2px dashed #3B82F6; border-radius: 12px; padding: 24px; text-align: center; margin: 24px 0; }
-          .code { font-size: 36px; font-weight: bold; letter-spacing: 8px; color: #1E40AF; font-family: 'Courier New', monospace; }
-          .label { font-size: 12px; color: #6B7280; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 8px; }
-          .info { background: #FEF3C7; border-left: 4px solid #F59E0B; padding: 12px 16px; border-radius: 8px; font-size: 13px; color: #92400E; margin: 20px 0; }
-          .footer { background: #F9FAFB; padding: 20px; text-align: center; font-size: 12px; color: #6B7280; border-top: 1px solid #E5E7EB; }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <div class="header"><h1>🔐 Password Reset</h1><p>SAMI ERP Security</p></div>
-          <div class="body">
-            <p>Hello <strong>${userName}</strong>,</p>
-            <p>Your password reset code is:</p>
-            <div class="code-box">
-              <div class="label">Verification Code</div>
-              <div class="code">${code}</div>
-            </div>
-            <div class="info">⏰ This code expires in 15 minutes.</div>
-          </div>
-          <div class="footer">© 2024 SAMI ERP</div>
-        </div>
-      </body>
-      </html>
-    `,
-    text: `SAMI ERP Password Reset\n\nHello ${userName},\n\nYour code: ${code}\n\nExpires in 15 minutes.`
-  };
-
   try {
-    const info = await transporter.sendMail(mailOptions);
-    console.log('📧 Email sent:', info.messageId);
-    return { success: true, messageId: info.messageId };
+    const response = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        'accept': 'application/json',
+        'api-key': BREVO_API_KEY,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        sender: { name: 'SAMI ERP', email: process.env.BREVO_SENDER_EMAIL || 'samsonteruneh@gmail.com' },
+        to: [{ email: toEmail }],
+        subject: '🔐 Password Reset Code - SAMI ERP',
+        htmlContent: `
+          <div style="font-family: sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+            <h2 style="color: #1E40AF;">SAMI ERP - Password Reset</h2>
+            <p>Hello <strong>${userName}</strong>,</p>
+            <p>Your code:</p>
+            <div style="background: #EFF6FF; border: 2px dashed #3B82F6; padding: 24px; text-align: center; margin: 20px 0;">
+              <p style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #1E40AF; margin: 0; font-family: monospace;">${code}</p>
+            </div>
+            <p>Expires in <strong>15 minutes</strong>.</p>
+          </div>
+        `
+      })
+    });
+
+    if (!response.ok) {
+      const err = await response.text();
+      throw new Error(err);
+    }
+    console.log('📧 Email sent:', toEmail);
+    return { success: true };
   } catch (error) {
-    console.error('❌ Email failed:', error.message);
+    console.error('❌ Brevo error:', error.message);
     return { success: false, error: error.message };
   }
 }
@@ -156,20 +118,12 @@ async function getUserFromToken(token) {
     const user = await getUserById(decoded.userId);
     if (!user) return null;
     return {
-      id: user.id,
-      username: user.username,
-      password: user.password,
-      firstName: user.first_name,
-      lastName: user.last_name,
-      email: user.email,
-      phone: user.phone,
-      active: user.active,
+      id: user.id, username: user.username, password: user.password,
+      firstName: user.first_name, lastName: user.last_name,
+      email: user.email, phone: user.phone, active: user.active,
       roles: user.roles || [],
     };
-  } catch (err) {
-    console.error('❌ Invalid token:', err.message);
-    return null;
-  }
+  } catch (err) { return null; }
 }
 
 function generateToken(userId) {
@@ -207,29 +161,18 @@ function hasPermission(user, module, action) {
 
 async function checkAuth(req, res, module, action, callback) {
   const auth = req.headers.authorization;
-  if (!auth) {
-    return sendJson(res, 401, { message: 'Authentication required' });
-  }
+  if (!auth) return sendJson(res, 401, { message: 'Authentication required' });
   
   const token = auth.split(' ')[1];
-  if (!token) {
-    return sendJson(res, 401, { message: 'Invalid token' });
-  }
+  if (!token) return sendJson(res, 401, { message: 'Invalid token' });
   
   const user = await getUserFromToken(token);
-  if (!user) {
-    return sendJson(res, 401, { message: 'User not found' });
-  }
-  
-  console.log(`🔐 ${user.username} (${user.firstName} ${user.lastName})`);
-  console.log(`   Roles: ${user.roles.join(', ')}`);
+  if (!user) return sendJson(res, 401, { message: 'User not found' });
   
   if (!hasPermission(user, module, action)) {
-    console.log(`   ❌ No permission for ${module}.${action}`);
     return sendJson(res, 403, { message: 'Insufficient permissions' });
   }
   
-  console.log(`   ✅ Has permission for ${module}.${action}`);
   await callback(user);
 }
 
@@ -297,32 +240,24 @@ const server = http.createServer(async (req, res) => {
           }
           
           if (!user.active) {
-            return sendJson(res, 401, { message: 'Account is inactive. Contact administrator.' });
+            return sendJson(res, 401, { message: 'Account inactive' });
           }
           
           const token = generateToken(user.id);
-          
           await query('UPDATE users SET last_login_at = NOW() WHERE id = $1', [user.id]);
-          
-          console.log(`✅ Login: ${user.username} | Roles: ${(user.roles || []).join(', ')}`);
           
           sendJson(res, 200, {
             accessToken: token,
             refreshToken: 'refresh-' + token,
             user: {
-              id: user.id,
-              username: user.username,
-              firstName: user.first_name,
-              lastName: user.last_name,
-              email: user.email,
-              phone: user.phone,
-              roles: user.roles || [],
-              preferences: user.preferences || {},
+              id: user.id, username: user.username,
+              firstName: user.first_name, lastName: user.last_name,
+              email: user.email, phone: user.phone,
+              roles: user.roles || [], preferences: user.preferences || {},
               permissions: ['*']
             }
           });
         } catch (error) {
-          console.error('❌ Login error:', error);
           sendJson(res, 500, { message: 'Login failed' });
         }
       });
@@ -349,28 +284,18 @@ const server = http.createServer(async (req, res) => {
     if (path === '/api/v1/auth/change-password' && method === 'POST') {
       const auth = req.headers.authorization;
       if (!auth) return sendJson(res, 401, { message: 'Authentication required' });
-      
       const token = auth.split(' ')[1];
       const user = await getUserFromToken(token);
       if (!user) return sendJson(res, 401, { message: 'User not found' });
       
       parseBody(req, async (err, body) => {
         if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
+        if (!body.currentPassword) return sendJson(res, 400, { message: 'Current password required' });
+        if (user.password !== body.currentPassword) return sendJson(res, 400, { message: 'Current password incorrect' });
+        if (!body.newPassword || body.newPassword.length < 6) return sendJson(res, 400, { message: 'New password must be 6+ chars' });
         
-        if (!body.currentPassword) return sendJson(res, 400, { message: 'Current password is required' });
-        if (user.password !== body.currentPassword) return sendJson(res, 400, { message: 'Current password is incorrect' });
-        if (!body.newPassword) return sendJson(res, 400, { message: 'New password is required' });
-        if (body.newPassword.length < 6) return sendJson(res, 400, { message: 'Password must be at least 6 characters' });
-        if (body.currentPassword === body.newPassword) return sendJson(res, 400, { message: 'New password must be different' });
-        
-        try {
-          await query('UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2', [body.newPassword, user.id]);
-          console.log(`✅ Password changed for ${user.username}`);
-          sendJson(res, 200, { message: 'Password changed successfully', requireRelogin: true });
-        } catch (error) {
-          console.error('❌ Password change error:', error);
-          sendJson(res, 500, { message: 'Failed to change password' });
-        }
+        await query('UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2', [body.newPassword, user.id]);
+        sendJson(res, 200, { message: 'Password changed', requireRelogin: true });
       });
       return;
     }
@@ -390,21 +315,16 @@ const server = http.createServer(async (req, res) => {
           );
           const user = result.rows[0];
           
-          if (!user) {
-            return sendJson(res, 200, { message: 'If account exists, code sent.', success: true });
-          }
-          
+          if (!user) return sendJson(res, 200, { message: 'If account exists, code sent.', success: true });
           if (!user.active) return sendJson(res, 400, { message: 'Account inactive' });
           
           const roles = user.roles || [];
           if (!roles.includes('Super Admin') && !roles.includes('Manager')) {
-            return sendJson(res, 403, { message: 'Password reset only available for administrators.' });
+            return sendJson(res, 403, { message: 'Admin only' });
           }
-          
-          if (!user.email) return sendJson(res, 400, { message: 'No email registered' });
+          if (!user.email) return sendJson(res, 400, { message: 'No email' });
           
           const code = Math.floor(100000 + Math.random() * 900000).toString();
-          const expiresAt = Date.now() + 15 * 60 * 1000;
           
           await query(
             `INSERT INTO password_reset_codes (user_id, code, expires_at, email, attempts)
@@ -413,19 +333,16 @@ const server = http.createServer(async (req, res) => {
             [user.id, code, user.email]
           );
           
-          console.log(`🔑 Reset code for ${user.username}: ${code}`);
-          
           const emailResult = await sendVerificationCode(user.email, code, `${user.first_name} ${user.last_name}`);
           const maskedEmail = user.email.replace(/(.{1})(.*)(@.*)/, '$1***$3');
           
-          if (!emailResult.success && process.env.NODE_ENV !== 'production') {
-            return sendJson(res, 200, { message: 'Email not configured. Code in terminal.', success: true, email: maskedEmail, devMode: true });
+          if (!emailResult.success) {
+            return sendJson(res, 500, { message: 'Failed to send email' });
           }
           
-          sendJson(res, 200, { message: `Code sent to ${maskedEmail}`, success: true, email: maskedEmail });
+          sendJson(res, 200, { message: `Code sent to ${maskedEmail}`, success: true });
         } catch (error) {
-          console.error('❌ Forgot password error:', error);
-          sendJson(res, 500, { message: 'Failed to process request' });
+          sendJson(res, 500, { message: 'Failed' });
         }
       });
       return;
@@ -447,24 +364,17 @@ const server = http.createServer(async (req, res) => {
           const resetResult = await query('SELECT * FROM password_reset_codes WHERE user_id = $1', [user.id]);
           const reset = resetResult.rows[0];
           
-          if (!reset) return sendJson(res, 400, { message: 'No reset request found' });
-          if (new Date(reset.expires_at) < new Date()) {
-            await query('DELETE FROM password_reset_codes WHERE user_id = $1', [user.id]);
-            return sendJson(res, 400, { message: 'Code expired' });
-          }
-          if (reset.attempts >= 5) {
-            await query('DELETE FROM password_reset_codes WHERE user_id = $1', [user.id]);
-            return sendJson(res, 400, { message: 'Too many attempts' });
-          }
+          if (!reset) return sendJson(res, 400, { message: 'No reset request' });
+          if (new Date(reset.expires_at) < new Date()) return sendJson(res, 400, { message: 'Expired' });
+          if (reset.attempts >= 5) return sendJson(res, 400, { message: 'Too many attempts' });
           if (reset.code !== code) {
             await query('UPDATE password_reset_codes SET attempts = attempts + 1 WHERE user_id = $1', [user.id]);
-            return sendJson(res, 400, { message: `Invalid code. ${5 - reset.attempts - 1} attempts left.` });
+            return sendJson(res, 400, { message: 'Invalid code' });
           }
           
-          sendJson(res, 200, { message: 'Code verified', success: true });
+          sendJson(res, 200, { message: 'Verified', success: true });
         } catch (error) {
-          console.error('❌ Verify error:', error);
-          sendJson(res, 500, { message: 'Failed to verify' });
+          sendJson(res, 500, { message: 'Failed' });
         }
       });
       return;
@@ -477,28 +387,26 @@ const server = http.createServer(async (req, res) => {
         
         const { username, code, newPassword } = body;
         if (!code || !newPassword) return sendJson(res, 400, { message: 'Code and password required' });
-        if (newPassword.length < 6) return sendJson(res, 400, { message: 'Password too short' });
+        if (newPassword.length < 6) return sendJson(res, 400, { message: 'Too short' });
         
         try {
           const userResult = await query('SELECT * FROM users WHERE username = $1', [username]);
           const user = userResult.rows[0];
-          if (!user) return sendJson(res, 400, { message: 'Invalid request' });
+          if (!user) return sendJson(res, 400, { message: 'Invalid' });
           
           const resetResult = await query('SELECT * FROM password_reset_codes WHERE user_id = $1', [user.id]);
           const reset = resetResult.rows[0];
           
-          if (!reset) return sendJson(res, 400, { message: 'No reset request' });
-          if (new Date(reset.expires_at) < new Date()) return sendJson(res, 400, { message: 'Code expired' });
+          if (!reset) return sendJson(res, 400, { message: 'No request' });
+          if (new Date(reset.expires_at) < new Date()) return sendJson(res, 400, { message: 'Expired' });
           if (reset.code !== code) return sendJson(res, 400, { message: 'Invalid code' });
           
-          await query('UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2', [newPassword, user.id]);
+          await query('UPDATE users SET password = $1 WHERE id = $2', [newPassword, user.id]);
           await query('DELETE FROM password_reset_codes WHERE user_id = $1', [user.id]);
           
-          console.log(`✅ Password reset: ${user.username}`);
-          sendJson(res, 200, { message: 'Password reset successfully', success: true });
+          sendJson(res, 200, { message: 'Password reset', success: true });
         } catch (error) {
-          console.error('❌ Reset error:', error);
-          sendJson(res, 500, { message: 'Failed to reset' });
+          sendJson(res, 500, { message: 'Failed' });
         }
       });
       return;
@@ -513,56 +421,43 @@ const server = http.createServer(async (req, res) => {
 
     // ============ USERS ============
     if (path === '/api/v1/users' && method === 'GET') {
-      await checkAuth(req, res, 'users', 'view', async (user) => {
+      await checkAuth(req, res, 'users', 'view', async () => {
         const result = await query('SELECT * FROM users ORDER BY id');
-        const users = result.rows.map(u => ({
-          id: u.id,
-          username: u.username,
-          firstName: u.first_name,
-          lastName: u.last_name,
-          email: u.email,
-          phone: u.phone,
-          active: u.active,
-          lastLoginAt: u.last_login_at,
-          createdAt: u.created_at,
-          roles: u.roles || [],
-          permissions: ['*']
-        }));
-        sendJson(res, 200, users);
+        sendJson(res, 200, result.rows.map(u => ({
+          id: u.id, username: u.username,
+          firstName: u.first_name, lastName: u.last_name,
+          email: u.email, phone: u.phone, active: u.active,
+          lastLoginAt: u.last_login_at, createdAt: u.created_at,
+          roles: u.roles || [], permissions: ['*']
+        })));
       });
       return;
     }
 
     if (path === '/api/v1/users' && method === 'POST') {
-      await checkAuth(req, res, 'users', 'create', async (currentUser) => {
+      await checkAuth(req, res, 'users', 'create', async () => {
         parseBody(req, async (err, body) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          
-          if (!body.username) return sendJson(res, 400, { message: 'Username required' });
-          if (!body.firstName || !body.lastName) return sendJson(res, 400, { message: 'Name required' });
-          if (!body.password) return sendJson(res, 400, { message: 'Password required' });
+          if (!body.username || !body.firstName || !body.lastName || !body.password) {
+            return sendJson(res, 400, { message: 'Missing fields' });
+          }
           if (body.password.length < 6) return sendJson(res, 400, { message: 'Password too short' });
           if (!body.roles || body.roles.length === 0) return sendJson(res, 400, { message: 'Role required' });
           
-          try {
-            const existing = await query('SELECT id FROM users WHERE username = $1', [body.username]);
-            if (existing.rows.length > 0) return sendJson(res, 400, { message: 'Username exists' });
-            
-            const result = await query(
-              `INSERT INTO users (username, password, first_name, last_name, email, phone, active, roles)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-              [body.username, body.password, body.firstName, body.lastName, body.email || null, body.phone || null, body.active !== false, body.roles]
-            );
-            
-            const u = result.rows[0];
-            sendJson(res, 201, {
-              id: u.id, username: u.username, firstName: u.first_name, lastName: u.last_name,
-              email: u.email, phone: u.phone, active: u.active, roles: u.roles
-            });
-          } catch (error) {
-            console.error('❌ Create user error:', error);
-            sendJson(res, 500, { message: 'Failed to create user' });
-          }
+          const existing = await query('SELECT id FROM users WHERE username = $1', [body.username]);
+          if (existing.rows.length > 0) return sendJson(res, 400, { message: 'Username exists' });
+          
+          const result = await query(
+            `INSERT INTO users (username, password, first_name, last_name, email, phone, active, roles)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+            [body.username, body.password, body.firstName, body.lastName, body.email || null, body.phone || null, body.active !== false, body.roles]
+          );
+          
+          const u = result.rows[0];
+          sendJson(res, 201, {
+            id: u.id, username: u.username, firstName: u.first_name, lastName: u.last_name,
+            email: u.email, phone: u.phone, active: u.active, roles: u.roles
+          });
         });
       });
       return;
@@ -570,44 +465,34 @@ const server = http.createServer(async (req, res) => {
 
     if (path.match(/^\/api\/v1\/users\/\d+$/) && method === 'PATCH') {
       const id = parseInt(path.split('/').pop());
-      await checkAuth(req, res, 'users', 'edit', async (currentUser) => {
+      await checkAuth(req, res, 'users', 'edit', async () => {
         parseBody(req, async (err, body) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
           
-          try {
-            const fields = [];
-            const values = [];
-            let idx = 1;
-            
-            if (body.email !== undefined) { fields.push(`email = $${idx++}`); values.push(body.email); }
-            if (body.firstName) { fields.push(`first_name = $${idx++}`); values.push(body.firstName); }
-            if (body.lastName) { fields.push(`last_name = $${idx++}`); values.push(body.lastName); }
-            if (body.phone !== undefined) { fields.push(`phone = $${idx++}`); values.push(body.phone); }
-            if (body.active !== undefined) { fields.push(`active = $${idx++}`); values.push(body.active); }
-            if (body.roles) { fields.push(`roles = $${idx++}`); values.push(body.roles); }
-            if (body.password) { fields.push(`password = $${idx++}`); values.push(body.password); }
-            
-            if (fields.length === 0) return sendJson(res, 400, { message: 'No fields to update' });
-            
-            fields.push(`updated_at = NOW()`);
-            values.push(id);
-            
-            const result = await query(
-              `UPDATE users SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
-              values
-            );
-            
-            if (result.rows.length === 0) return sendJson(res, 404, { message: 'User not found' });
-            
-            const u = result.rows[0];
-            sendJson(res, 200, {
-              id: u.id, username: u.username, firstName: u.first_name, lastName: u.last_name,
-              email: u.email, phone: u.phone, active: u.active, roles: u.roles
-            });
-          } catch (error) {
-            console.error('❌ Update user error:', error);
-            sendJson(res, 500, { message: 'Failed to update user' });
-          }
+          const fields = [];
+          const values = [];
+          let idx = 1;
+          
+          if (body.email !== undefined) { fields.push(`email = $${idx++}`); values.push(body.email); }
+          if (body.firstName) { fields.push(`first_name = $${idx++}`); values.push(body.firstName); }
+          if (body.lastName) { fields.push(`last_name = $${idx++}`); values.push(body.lastName); }
+          if (body.phone !== undefined) { fields.push(`phone = $${idx++}`); values.push(body.phone); }
+          if (body.active !== undefined) { fields.push(`active = $${idx++}`); values.push(body.active); }
+          if (body.roles) { fields.push(`roles = $${idx++}`); values.push(body.roles); }
+          if (body.password) { fields.push(`password = $${idx++}`); values.push(body.password); }
+          
+          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
+          fields.push(`updated_at = NOW()`);
+          values.push(id);
+          
+          const result = await query(`UPDATE users SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
+          
+          const u = result.rows[0];
+          sendJson(res, 200, {
+            id: u.id, username: u.username, firstName: u.first_name, lastName: u.last_name,
+            email: u.email, phone: u.phone, active: u.active, roles: u.roles
+          });
         });
       });
       return;
@@ -650,36 +535,24 @@ const server = http.createServer(async (req, res) => {
         parseBody(req, async (err, body) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
           
-          try {
-            const result = await query(
-              `INSERT INTO products (sku, barcode, name, description, brand, category, unit, selling_price, cost_price, stock, reorder_level, reorder_quantity, active)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-              [
-                body.sku || `PRD-${Date.now()}`,
-                body.barcode || '',
-                body.name,
-                body.description || '',
-                body.brand || '',
-                body.category || '',
-                body.unit || 'Piece',
-                parseFloat(body.sellingPrice) || 0,
-                parseFloat(body.costPrice) || 0,
-                parseInt(body.stock) || 0,
-                parseInt(body.reorderLevel) || 0,
-                parseInt(body.reorderQuantity) || 0,
-                body.active !== false
-              ]
-            );
-            const p = result.rows[0];
-            sendJson(res, 201, {
-              id: p.id, sku: p.sku, barcode: p.barcode, name: p.name,
-              sellingPrice: parseFloat(p.selling_price), costPrice: parseFloat(p.cost_price),
-              stock: p.stock, reorderLevel: p.reorder_level, active: p.active
-            });
-          } catch (error) {
-            console.error('❌ Create product error:', error);
-            sendJson(res, 500, { message: 'Failed to create product' });
-          }
+          const result = await query(
+            `INSERT INTO products (sku, barcode, name, description, brand, category, unit, selling_price, cost_price, stock, reorder_level, reorder_quantity, active)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+            [
+              body.sku || `PRD-${Date.now()}`,
+              body.barcode || '', body.name, body.description || '',
+              body.brand || '', body.category || '', body.unit || 'Piece',
+              parseFloat(body.sellingPrice) || 0, parseFloat(body.costPrice) || 0,
+              parseInt(body.stock) || 0, parseInt(body.reorderLevel) || 0,
+              parseInt(body.reorderQuantity) || 0, body.active !== false
+            ]
+          );
+          const p = result.rows[0];
+          sendJson(res, 201, {
+            id: p.id, sku: p.sku, barcode: p.barcode, name: p.name,
+            sellingPrice: parseFloat(p.selling_price), costPrice: parseFloat(p.cost_price),
+            stock: p.stock, reorderLevel: p.reorder_level, active: p.active
+          });
         });
       });
       return;
@@ -691,46 +564,35 @@ const server = http.createServer(async (req, res) => {
         parseBody(req, async (err, body) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
           
-          try {
-            const fields = [];
-            const values = [];
-            let idx = 1;
-            
-            const map = {
-              sku: 'sku', barcode: 'barcode', name: 'name', description: 'description',
-              brand: 'brand', category: 'category', unit: 'unit',
-              sellingPrice: 'selling_price', costPrice: 'cost_price',
-              stock: 'stock', reorderLevel: 'reorder_level', reorderQuantity: 'reorder_quantity',
-              active: 'active'
-            };
-            
-            for (const [key, col] of Object.entries(map)) {
-              if (body[key] !== undefined) {
-                fields.push(`${col} = $${idx++}`);
-                values.push(body[key]);
-              }
-            }
-            
-            if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
-            fields.push('updated_at = NOW()');
-            values.push(id);
-            
-            const result = await query(
-              `UPDATE products SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`,
-              values
-            );
-            
-            if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-            const p = result.rows[0];
-            sendJson(res, 200, {
-              id: p.id, sku: p.sku, name: p.name,
-              sellingPrice: parseFloat(p.selling_price), costPrice: parseFloat(p.cost_price),
-              stock: p.stock, reorderLevel: p.reorder_level, active: p.active
-            });
-          } catch (error) {
-            console.error('❌ Update product error:', error);
-            sendJson(res, 500, { message: 'Failed to update product' });
+          const fields = [];
+          const values = [];
+          let idx = 1;
+          
+          const map = {
+            sku: 'sku', barcode: 'barcode', name: 'name', description: 'description',
+            brand: 'brand', category: 'category', unit: 'unit',
+            sellingPrice: 'selling_price', costPrice: 'cost_price',
+            stock: 'stock', reorderLevel: 'reorder_level', reorderQuantity: 'reorder_quantity',
+            active: 'active'
+          };
+          
+          for (const [key, col] of Object.entries(map)) {
+            if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
           }
+          
+          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
+          fields.push('updated_at = NOW()');
+          values.push(id);
+          
+          const result = await query(`UPDATE products SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
+          
+          const p = result.rows[0];
+          sendJson(res, 200, {
+            id: p.id, sku: p.sku, name: p.name,
+            sellingPrice: parseFloat(p.selling_price), costPrice: parseFloat(p.cost_price),
+            stock: p.stock, reorderLevel: p.reorder_level, active: p.active
+          });
         });
       });
       return;
@@ -741,7 +603,7 @@ const server = http.createServer(async (req, res) => {
       await checkAuth(req, res, 'products', 'delete', async () => {
         const result = await query('DELETE FROM products WHERE id = $1 RETURNING *', [id]);
         if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-        sendJson(res, 200, { message: 'Product deleted' });
+        sendJson(res, 200, { message: 'Deleted' });
       });
       return;
     }
@@ -765,29 +627,24 @@ const server = http.createServer(async (req, res) => {
         parseBody(req, async (err, body) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
           
-          try {
-            const codeResult = await query("SELECT COUNT(*) FROM customers");
-            const count = parseInt(codeResult.rows[0].count) + 1;
-            const customerCode = `CUST-${String(count).padStart(3, '0')}`;
-            
-            const result = await query(
-              `INSERT INTO customers (customer_code, name, phone, email, address, balance, credit_limit, active)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-              [customerCode, body.name, body.phone || null, body.email || null,
-               body.address || null, parseFloat(body.balance) || 0,
-               parseFloat(body.creditLimit) || 0, body.active !== false]
-            );
-            
-            const c = result.rows[0];
-            sendJson(res, 201, {
-              id: c.id, customerCode: c.customer_code, name: c.name,
-              phone: c.phone, email: c.email, balance: parseFloat(c.balance),
-              creditLimit: parseFloat(c.credit_limit), active: c.active
-            });
-          } catch (error) {
-            console.error('❌ Create customer error:', error);
-            sendJson(res, 500, { message: 'Failed to create customer' });
-          }
+          const codeResult = await query("SELECT COUNT(*) FROM customers");
+          const count = parseInt(codeResult.rows[0].count) + 1;
+          const customerCode = `CUST-${String(count).padStart(3, '0')}`;
+          
+          const result = await query(
+            `INSERT INTO customers (customer_code, name, phone, email, address, balance, credit_limit, active)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+            [customerCode, body.name, body.phone || null, body.email || null,
+             body.address || null, parseFloat(body.balance) || 0,
+             parseFloat(body.creditLimit) || 0, body.active !== false]
+          );
+          
+          const c = result.rows[0];
+          sendJson(res, 201, {
+            id: c.id, customerCode: c.customer_code, name: c.name,
+            phone: c.phone, email: c.email, balance: parseFloat(c.balance),
+            creditLimit: parseFloat(c.credit_limit), active: c.active
+          });
         });
       });
       return;
@@ -799,40 +656,32 @@ const server = http.createServer(async (req, res) => {
         parseBody(req, async (err, body) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
           
-          try {
-            const fields = [];
-            const values = [];
-            let idx = 1;
-            
-            const map = {
-              name: 'name', phone: 'phone', email: 'email', address: 'address',
-              balance: 'balance', creditLimit: 'credit_limit', active: 'active'
-            };
-            
-            for (const [key, col] of Object.entries(map)) {
-              if (body[key] !== undefined) {
-                fields.push(`${col} = $${idx++}`);
-                values.push(body[key]);
-              }
-            }
-            
-            if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
-            fields.push('updated_at = NOW()');
-            values.push(id);
-            
-            const result = await query(`UPDATE customers SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
-            if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-            
-            const c = result.rows[0];
-            sendJson(res, 200, {
-              id: c.id, customerCode: c.customer_code, name: c.name,
-              phone: c.phone, email: c.email, balance: parseFloat(c.balance),
-              creditLimit: parseFloat(c.credit_limit), active: c.active
-            });
-          } catch (error) {
-            console.error('❌ Update customer error:', error);
-            sendJson(res, 500, { message: 'Failed to update' });
+          const fields = [];
+          const values = [];
+          let idx = 1;
+          
+          const map = {
+            name: 'name', phone: 'phone', email: 'email', address: 'address',
+            balance: 'balance', creditLimit: 'credit_limit', active: 'active'
+          };
+          
+          for (const [key, col] of Object.entries(map)) {
+            if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
           }
+          
+          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
+          fields.push('updated_at = NOW()');
+          values.push(id);
+          
+          const result = await query(`UPDATE customers SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
+          
+          const c = result.rows[0];
+          sendJson(res, 200, {
+            id: c.id, customerCode: c.customer_code, name: c.name,
+            phone: c.phone, email: c.email, balance: parseFloat(c.balance),
+            creditLimit: parseFloat(c.credit_limit), active: c.active
+          });
         });
       });
       return;
@@ -860,31 +709,26 @@ const server = http.createServer(async (req, res) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
           if (!body.name) return sendJson(res, 400, { message: 'Name required' });
           
-          try {
-            const codeResult = await query("SELECT COUNT(*) FROM suppliers");
-            const count = parseInt(codeResult.rows[0].count) + 1;
-            const supplierCode = `SUP-${String(count).padStart(3, '0')}`;
-            
-            const result = await query(
-              `INSERT INTO suppliers (supplier_code, name, contact_person, phone, email, address, city, country, tax_id, payment_terms, credit_limit, balance, notes, active)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
-              [supplierCode, body.name, body.contactPerson || null, body.phone || null,
-               body.email || null, body.address || null, body.city || null,
-               body.country || 'Ethiopia', body.taxId || null, body.paymentTerms || 'Cash',
-               parseFloat(body.creditLimit) || 0, parseFloat(body.balance) || 0,
-               body.notes || null, body.active !== false]
-            );
-            
-            const s = result.rows[0];
-            sendJson(res, 201, {
-              id: s.id, supplierCode: s.supplier_code, name: s.name,
-              contactPerson: s.contact_person, phone: s.phone, email: s.email,
-              balance: parseFloat(s.balance), active: s.active
-            });
-          } catch (error) {
-            console.error('❌ Create supplier error:', error);
-            sendJson(res, 500, { message: 'Failed to create supplier' });
-          }
+          const codeResult = await query("SELECT COUNT(*) FROM suppliers");
+          const count = parseInt(codeResult.rows[0].count) + 1;
+          const supplierCode = `SUP-${String(count).padStart(3, '0')}`;
+          
+          const result = await query(
+            `INSERT INTO suppliers (supplier_code, name, contact_person, phone, email, address, city, country, tax_id, payment_terms, credit_limit, balance, notes, active)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+            [supplierCode, body.name, body.contactPerson || null, body.phone || null,
+             body.email || null, body.address || null, body.city || null,
+             body.country || 'Ethiopia', body.taxId || null, body.paymentTerms || 'Cash',
+             parseFloat(body.creditLimit) || 0, parseFloat(body.balance) || 0,
+             body.notes || null, body.active !== false]
+          );
+          
+          const s = result.rows[0];
+          sendJson(res, 201, {
+            id: s.id, supplierCode: s.supplier_code, name: s.name,
+            contactPerson: s.contact_person, phone: s.phone, email: s.email,
+            balance: parseFloat(s.balance), active: s.active
+          });
         });
       });
       return;
@@ -896,42 +740,34 @@ const server = http.createServer(async (req, res) => {
         parseBody(req, async (err, body) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
           
-          try {
-            const fields = [];
-            const values = [];
-            let idx = 1;
-            
-            const map = {
-              name: 'name', contactPerson: 'contact_person', phone: 'phone', email: 'email',
-              address: 'address', city: 'city', country: 'country', taxId: 'tax_id',
-              paymentTerms: 'payment_terms', creditLimit: 'credit_limit',
-              balance: 'balance', notes: 'notes', active: 'active'
-            };
-            
-            for (const [key, col] of Object.entries(map)) {
-              if (body[key] !== undefined) {
-                fields.push(`${col} = $${idx++}`);
-                values.push(body[key]);
-              }
-            }
-            
-            if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
-            fields.push('updated_at = NOW()');
-            values.push(id);
-            
-            const result = await query(`UPDATE suppliers SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
-            if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-            
-            const s = result.rows[0];
-            sendJson(res, 200, {
-              id: s.id, supplierCode: s.supplier_code, name: s.name,
-              contactPerson: s.contact_person, phone: s.phone, email: s.email,
-              balance: parseFloat(s.balance), active: s.active
-            });
-          } catch (error) {
-            console.error('❌ Update supplier error:', error);
-            sendJson(res, 500, { message: 'Failed to update supplier' });
+          const fields = [];
+          const values = [];
+          let idx = 1;
+          
+          const map = {
+            name: 'name', contactPerson: 'contact_person', phone: 'phone', email: 'email',
+            address: 'address', city: 'city', country: 'country', taxId: 'tax_id',
+            paymentTerms: 'payment_terms', creditLimit: 'credit_limit',
+            balance: 'balance', notes: 'notes', active: 'active'
+          };
+          
+          for (const [key, col] of Object.entries(map)) {
+            if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
           }
+          
+          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
+          fields.push('updated_at = NOW()');
+          values.push(id);
+          
+          const result = await query(`UPDATE suppliers SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
+          
+          const s = result.rows[0];
+          sendJson(res, 200, {
+            id: s.id, supplierCode: s.supplier_code, name: s.name,
+            contactPerson: s.contact_person, phone: s.phone, email: s.email,
+            balance: parseFloat(s.balance), active: s.active
+          });
         });
       });
       return;
@@ -942,7 +778,7 @@ const server = http.createServer(async (req, res) => {
       await checkAuth(req, res, 'suppliers', 'delete', async () => {
         const result = await query('DELETE FROM suppliers WHERE id = $1 RETURNING *', [id]);
         if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-        sendJson(res, 200, { message: 'Supplier deleted' });
+        sendJson(res, 200, { message: 'Deleted' });
       });
       return;
     }
@@ -973,7 +809,7 @@ const server = http.createServer(async (req, res) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
           
           const { items, customerId, paymentMethod, amountReceived, notes, discount } = body;
-          if (!items || items.length === 0) return sendJson(res, 400, { message: 'Sale must have items' });
+          if (!items || items.length === 0) return sendJson(res, 400, { message: 'No items' });
           
           const client = await pool.connect();
           try {
@@ -997,14 +833,10 @@ const server = http.createServer(async (req, res) => {
               const lineTotal = item.quantity * item.unitPrice - (item.discount || 0);
               subtotal += lineTotal;
               saleItems.push({
-                productId: product.id,
-                productNameSnapshot: product.name,
-                quantity: item.quantity,
-                unitPrice: item.unitPrice,
+                productId: product.id, productNameSnapshot: product.name,
+                quantity: item.quantity, unitPrice: item.unitPrice,
                 unitCost: parseFloat(product.cost_price),
-                discount: item.discount || 0,
-                tax: item.tax || 0,
-                lineTotal
+                discount: item.discount || 0, tax: item.tax || 0, lineTotal
               });
               
               await client.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [item.quantity, item.productId]);
@@ -1062,7 +894,6 @@ const server = http.createServer(async (req, res) => {
             sendJson(res, 201, { ...sale, receipt: generateReceipt(sale) });
           } catch (error) {
             await client.query('ROLLBACK');
-            console.error('❌ Sale error:', error);
             sendJson(res, 500, { message: 'Failed to create sale' });
           } finally {
             client.release();
@@ -1076,7 +907,7 @@ const server = http.createServer(async (req, res) => {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'sales', 'delete', async (user) => {
         if (!user.roles.includes('Super Admin')) {
-          return sendJson(res, 403, { message: 'Only Super Admin can delete sales' });
+          return sendJson(res, 403, { message: 'Super Admin only' });
         }
         
         const client = await pool.connect();
@@ -1087,7 +918,7 @@ const server = http.createServer(async (req, res) => {
           const sale = saleResult.rows[0];
           if (!sale) {
             await client.query('ROLLBACK');
-            return sendJson(res, 404, { message: 'Sale not found' });
+            return sendJson(res, 404, { message: 'Not found' });
           }
           
           const items = sale.items || [];
@@ -1102,11 +933,10 @@ const server = http.createServer(async (req, res) => {
           await client.query('DELETE FROM sales WHERE id = $1', [id]);
           await client.query('COMMIT');
           
-          sendJson(res, 200, { message: 'Sale deleted', sale, stockRestored: true });
+          sendJson(res, 200, { message: 'Sale deleted', stockRestored: true });
         } catch (error) {
           await client.query('ROLLBACK');
-          console.error('❌ Delete sale error:', error);
-          sendJson(res, 500, { message: 'Failed to delete sale' });
+          sendJson(res, 500, { message: 'Failed to delete' });
         } finally {
           client.release();
         }
@@ -1141,55 +971,46 @@ const server = http.createServer(async (req, res) => {
         parseBody(req, async (err, body) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
           
-          try {
-            const unitPrice = parseFloat(body.unitPrice) || 0;
-            const quantity = parseInt(body.quantity) || 1;
-            const discount = parseFloat(body.discount) || 0;
-            const tax = parseFloat(body.tax) || 0;
-            const total = (unitPrice * quantity) - discount + tax;
-            const amountPaid = parseFloat(body.amountPaid) || 0;
-            const balance = total - amountPaid;
-            
-            const countResult = await query('SELECT COUNT(*) FROM services');
-            const count = parseInt(countResult.rows[0].count) + 1;
-            const jobNumber = `SRV-${new Date().getFullYear()}-${String(count).padStart(4, '0')}`;
-            
-            const fullName = `${user.firstName} ${user.lastName}`;
-            
-            const result = await query(
-              `INSERT INTO services (job_number, customer_id, customer_name, customer_phone,
-                service_type_id, service_type, description, quantity, unit_price, discount, tax,
-                total, amount_paid, balance, received_date, expected_date, priority, status, notes,
-                created_by, created_by_name, created_by_username)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) RETURNING *`,
-              [
-                jobNumber,
-                body.customerId ? parseInt(body.customerId) : null,
-                body.customerName || null,
-                body.customerPhone || null,
-                body.serviceTypeId ? parseInt(body.serviceTypeId) : null,
-                body.serviceType || '',
-                body.description || '',
-                quantity, unitPrice, discount, tax, total, amountPaid, balance,
-                body.receivedDate ? new Date(body.receivedDate).toISOString() : new Date().toISOString(),
-                body.expectedDate || null,
-                body.priority || 'Normal',
-                body.status || 'Received',
-                body.notes || null,
-                user.id, fullName, user.username
-              ]
-            );
-            
-            const s = result.rows[0];
-            sendJson(res, 201, {
-              id: s.id, jobNumber: s.job_number, serviceType: s.service_type,
-              total: parseFloat(s.total), status: s.status,
-              receivedDate: s.received_date, createdAt: s.created_at
-            });
-          } catch (error) {
-            console.error('❌ Create service error:', error);
-            sendJson(res, 500, { message: 'Failed to create service' });
-          }
+          const unitPrice = parseFloat(body.unitPrice) || 0;
+          const quantity = parseInt(body.quantity) || 1;
+          const discount = parseFloat(body.discount) || 0;
+          const tax = parseFloat(body.tax) || 0;
+          const total = (unitPrice * quantity) - discount + tax;
+          const amountPaid = parseFloat(body.amountPaid) || 0;
+          const balance = total - amountPaid;
+          
+          const countResult = await query('SELECT COUNT(*) FROM services');
+          const count = parseInt(countResult.rows[0].count) + 1;
+          const jobNumber = `SRV-${new Date().getFullYear()}-${String(count).padStart(4, '0')}`;
+          
+          const fullName = `${user.firstName} ${user.lastName}`;
+          
+          const result = await query(
+            `INSERT INTO services (job_number, customer_id, customer_name, customer_phone,
+              service_type_id, service_type, description, quantity, unit_price, discount, tax,
+              total, amount_paid, balance, received_date, expected_date, priority, status, notes,
+              created_by, created_by_name, created_by_username)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) RETURNING *`,
+            [
+              jobNumber,
+              body.customerId ? parseInt(body.customerId) : null,
+              body.customerName || null, body.customerPhone || null,
+              body.serviceTypeId ? parseInt(body.serviceTypeId) : null,
+              body.serviceType || '', body.description || '',
+              quantity, unitPrice, discount, tax, total, amountPaid, balance,
+              body.receivedDate ? new Date(body.receivedDate).toISOString() : new Date().toISOString(),
+              body.expectedDate || null, body.priority || 'Normal',
+              body.status || 'Received', body.notes || null,
+              user.id, fullName, user.username
+            ]
+          );
+          
+          const s = result.rows[0];
+          sendJson(res, 201, {
+            id: s.id, jobNumber: s.job_number, serviceType: s.service_type,
+            total: parseFloat(s.total), status: s.status,
+            receivedDate: s.received_date, createdAt: s.created_at
+          });
         });
       });
       return;
@@ -1201,43 +1022,35 @@ const server = http.createServer(async (req, res) => {
         parseBody(req, async (err, body) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
           
-          try {
-            const fields = [];
-            const values = [];
-            let idx = 1;
-            
-            const map = {
-              customerId: 'customer_id', customerName: 'customer_name', customerPhone: 'customer_phone',
-              serviceTypeId: 'service_type_id', serviceType: 'service_type', description: 'description',
-              quantity: 'quantity', unitPrice: 'unit_price', discount: 'discount', tax: 'tax',
-              total: 'total', amountPaid: 'amount_paid', balance: 'balance',
-              receivedDate: 'received_date', expectedDate: 'expected_date', completedDate: 'completed_date',
-              priority: 'priority', status: 'status', notes: 'notes'
-            };
-            
-            for (const [key, col] of Object.entries(map)) {
-              if (body[key] !== undefined) {
-                fields.push(`${col} = $${idx++}`);
-                values.push(body[key]);
-              }
-            }
-            
-            if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
-            fields.push('updated_at = NOW()');
-            values.push(id);
-            
-            const result = await query(`UPDATE services SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
-            if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-            
-            const s = result.rows[0];
-            sendJson(res, 200, {
-              id: s.id, jobNumber: s.job_number, status: s.status,
-              total: parseFloat(s.total), amountPaid: parseFloat(s.amount_paid)
-            });
-          } catch (error) {
-            console.error('❌ Update service error:', error);
-            sendJson(res, 500, { message: 'Failed to update service' });
+          const fields = [];
+          const values = [];
+          let idx = 1;
+          
+          const map = {
+            customerId: 'customer_id', customerName: 'customer_name', customerPhone: 'customer_phone',
+            serviceTypeId: 'service_type_id', serviceType: 'service_type', description: 'description',
+            quantity: 'quantity', unitPrice: 'unit_price', discount: 'discount', tax: 'tax',
+            total: 'total', amountPaid: 'amount_paid', balance: 'balance',
+            receivedDate: 'received_date', expectedDate: 'expected_date', completedDate: 'completed_date',
+            priority: 'priority', status: 'status', notes: 'notes'
+          };
+          
+          for (const [key, col] of Object.entries(map)) {
+            if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
           }
+          
+          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
+          fields.push('updated_at = NOW()');
+          values.push(id);
+          
+          const result = await query(`UPDATE services SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
+          
+          const s = result.rows[0];
+          sendJson(res, 200, {
+            id: s.id, jobNumber: s.job_number, status: s.status,
+            total: parseFloat(s.total), amountPaid: parseFloat(s.amount_paid)
+          });
         });
       });
       return;
@@ -1248,7 +1061,7 @@ const server = http.createServer(async (req, res) => {
       await checkAuth(req, res, 'services', 'delete', async () => {
         const result = await query('DELETE FROM services WHERE id = $1 RETURNING *', [id]);
         if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-        sendJson(res, 200, { message: 'Service deleted' });
+        sendJson(res, 200, { message: 'Deleted' });
       });
       return;
     }
@@ -1271,20 +1084,15 @@ const server = http.createServer(async (req, res) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
           if (!body.name) return sendJson(res, 400, { message: 'Name required' });
           
-          try {
-            const result = await query(
-              'INSERT INTO service_types (name, description, default_price, active) VALUES ($1,$2,$3,$4) RETURNING *',
-              [body.name, body.description || '', parseFloat(body.defaultPrice) || 0, body.active !== false]
-            );
-            const t = result.rows[0];
-            sendJson(res, 201, {
-              id: t.id, name: t.name, description: t.description,
-              defaultPrice: parseFloat(t.default_price), active: t.active
-            });
-          } catch (error) {
-            console.error('❌ Create type error:', error);
-            sendJson(res, 500, { message: 'Failed to create type' });
-          }
+          const result = await query(
+            'INSERT INTO service_types (name, description, default_price, active) VALUES ($1,$2,$3,$4) RETURNING *',
+            [body.name, body.description || '', parseFloat(body.defaultPrice) || 0, body.active !== false]
+          );
+          const t = result.rows[0];
+          sendJson(res, 201, {
+            id: t.id, name: t.name, description: t.description,
+            defaultPrice: parseFloat(t.default_price), active: t.active
+          });
         });
       });
       return;
@@ -1296,31 +1104,26 @@ const server = http.createServer(async (req, res) => {
         parseBody(req, async (err, body) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
           
-          try {
-            const fields = [];
-            const values = [];
-            let idx = 1;
-            
-            if (body.name !== undefined) { fields.push(`name = $${idx++}`); values.push(body.name); }
-            if (body.description !== undefined) { fields.push(`description = $${idx++}`); values.push(body.description); }
-            if (body.defaultPrice !== undefined) { fields.push(`default_price = $${idx++}`); values.push(body.defaultPrice); }
-            if (body.active !== undefined) { fields.push(`active = $${idx++}`); values.push(body.active); }
-            
-            if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
-            values.push(id);
-            
-            const result = await query(`UPDATE service_types SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
-            if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-            
-            const t = result.rows[0];
-            sendJson(res, 200, {
-              id: t.id, name: t.name, description: t.description,
-              defaultPrice: parseFloat(t.default_price), active: t.active
-            });
-          } catch (error) {
-            console.error('❌ Update type error:', error);
-            sendJson(res, 500, { message: 'Failed to update type' });
-          }
+          const fields = [];
+          const values = [];
+          let idx = 1;
+          
+          if (body.name !== undefined) { fields.push(`name = $${idx++}`); values.push(body.name); }
+          if (body.description !== undefined) { fields.push(`description = $${idx++}`); values.push(body.description); }
+          if (body.defaultPrice !== undefined) { fields.push(`default_price = $${idx++}`); values.push(body.defaultPrice); }
+          if (body.active !== undefined) { fields.push(`active = $${idx++}`); values.push(body.active); }
+          
+          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
+          values.push(id);
+          
+          const result = await query(`UPDATE service_types SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
+          
+          const t = result.rows[0];
+          sendJson(res, 200, {
+            id: t.id, name: t.name, description: t.description,
+            defaultPrice: parseFloat(t.default_price), active: t.active
+          });
         });
       });
       return;
@@ -1331,7 +1134,7 @@ const server = http.createServer(async (req, res) => {
       await checkAuth(req, res, 'services', 'delete', async () => {
         const result = await query('DELETE FROM service_types WHERE id = $1 RETURNING *', [id]);
         if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-        sendJson(res, 200, { message: 'Type deleted' });
+        sendJson(res, 200, { message: 'Deleted' });
       });
       return;
     }
@@ -1359,37 +1162,32 @@ const server = http.createServer(async (req, res) => {
         parseBody(req, async (err, body) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
           
-          try {
-            const countResult = await query('SELECT COUNT(*) FROM expenses');
-            const count = parseInt(countResult.rows[0].count) + 1;
-            const expenseNumber = `EXP-${new Date().getFullYear()}-${String(count).padStart(4, '0')}`;
-            
-            const amount = parseFloat(body.amount) || 0;
-            const tax = parseFloat(body.tax) || 0;
-            const total = amount + tax;
-            const fullName = `${user.firstName} ${user.lastName}`;
-            
-            const result = await query(
-              `INSERT INTO expenses (expense_number, description, category, amount, tax, total,
-                expense_date, payment_method, status, notes, created_by, created_by_name, created_by_username)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-              [
-                expenseNumber, body.description, body.category || 'Other',
-                amount, tax, total, body.expenseDate || new Date().toISOString().split('T')[0],
-                body.paymentMethod || 'Cash', 'Pending', body.notes || null,
-                user.id, fullName, user.username
-              ]
-            );
-            
-            const e = result.rows[0];
-            sendJson(res, 201, {
-              id: e.id, expenseNumber: e.expense_number, description: e.description,
-              amount: parseFloat(e.amount), total: parseFloat(e.total), status: e.status
-            });
-          } catch (error) {
-            console.error('❌ Create expense error:', error);
-            sendJson(res, 500, { message: 'Failed to create expense' });
-          }
+          const countResult = await query('SELECT COUNT(*) FROM expenses');
+          const count = parseInt(countResult.rows[0].count) + 1;
+          const expenseNumber = `EXP-${new Date().getFullYear()}-${String(count).padStart(4, '0')}`;
+          
+          const amount = parseFloat(body.amount) || 0;
+          const tax = parseFloat(body.tax) || 0;
+          const total = amount + tax;
+          const fullName = `${user.firstName} ${user.lastName}`;
+          
+          const result = await query(
+            `INSERT INTO expenses (expense_number, description, category, amount, tax, total,
+              expense_date, payment_method, status, notes, created_by, created_by_name, created_by_username)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+            [
+              expenseNumber, body.description, body.category || 'Other',
+              amount, tax, total, body.expenseDate || new Date().toISOString().split('T')[0],
+              body.paymentMethod || 'Cash', 'Pending', body.notes || null,
+              user.id, fullName, user.username
+            ]
+          );
+          
+          const e = result.rows[0];
+          sendJson(res, 201, {
+            id: e.id, expenseNumber: e.expense_number, description: e.description,
+            amount: parseFloat(e.amount), total: parseFloat(e.total), status: e.status
+          });
         });
       });
       return;
@@ -1403,27 +1201,22 @@ const server = http.createServer(async (req, res) => {
         parseBody(req, async (err, body) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
           
-          try {
-            const status = body.status || 'Approved';
-            const fullName = `${user.firstName} ${user.lastName}`;
-            
-            const result = await query(
-              `UPDATE expenses SET status = $1, approved_by = $2, approved_by_name = $3, approved_at = NOW(), updated_at = NOW()
-               WHERE id = $4 RETURNING *`,
-              [status, user.id, fullName, id]
-            );
-            
-            if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-            
-            const e = result.rows[0];
-            sendJson(res, 200, {
-              id: e.id, expenseNumber: e.expense_number, status: e.status,
-              approvedByName: e.approved_by_name, approvedAt: e.approved_at
-            });
-          } catch (error) {
-            console.error('❌ Approve error:', error);
-            sendJson(res, 500, { message: 'Failed to approve' });
-          }
+          const status = body.status || 'Approved';
+          const fullName = `${user.firstName} ${user.lastName}`;
+          
+          const result = await query(
+            `UPDATE expenses SET status = $1, approved_by = $2, approved_by_name = $3, approved_at = NOW(), updated_at = NOW()
+             WHERE id = $4 RETURNING *`,
+            [status, user.id, fullName, id]
+          );
+          
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
+          
+          const e = result.rows[0];
+          sendJson(res, 200, {
+            id: e.id, expenseNumber: e.expense_number, status: e.status,
+            approvedByName: e.approved_by_name, approvedAt: e.approved_at
+          });
         });
       });
       return;
@@ -1431,44 +1224,36 @@ const server = http.createServer(async (req, res) => {
 
     if (path.match(/^\/api\/v1\/expenses\/\d+$/) && method === 'PATCH') {
       const id = parseInt(path.split('/').pop());
-      await checkAuth(req, res, 'expenses', 'approve', async (user) => {
+      await checkAuth(req, res, 'expenses', 'approve', async () => {
         parseBody(req, async (err, body) => {
           if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
           
-          try {
-            const fields = [];
-            const values = [];
-            let idx = 1;
-            
-            const map = {
-              description: 'description', category: 'category', amount: 'amount',
-              tax: 'tax', total: 'total', expenseDate: 'expense_date',
-              paymentMethod: 'payment_method', status: 'status', notes: 'notes'
-            };
-            
-            for (const [key, col] of Object.entries(map)) {
-              if (body[key] !== undefined) {
-                fields.push(`${col} = $${idx++}`);
-                values.push(body[key]);
-              }
-            }
-            
-            if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
-            fields.push('updated_at = NOW()');
-            values.push(id);
-            
-            const result = await query(`UPDATE expenses SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
-            if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-            
-            const e = result.rows[0];
-            sendJson(res, 200, {
-              id: e.id, expenseNumber: e.expense_number, description: e.description,
-              amount: parseFloat(e.amount), status: e.status
-            });
-          } catch (error) {
-            console.error('❌ Update expense error:', error);
-            sendJson(res, 500, { message: 'Failed to update' });
+          const fields = [];
+          const values = [];
+          let idx = 1;
+          
+          const map = {
+            description: 'description', category: 'category', amount: 'amount',
+            tax: 'tax', total: 'total', expenseDate: 'expense_date',
+            paymentMethod: 'payment_method', status: 'status', notes: 'notes'
+          };
+          
+          for (const [key, col] of Object.entries(map)) {
+            if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
           }
+          
+          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
+          fields.push('updated_at = NOW()');
+          values.push(id);
+          
+          const result = await query(`UPDATE expenses SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
+          
+          const e = result.rows[0];
+          sendJson(res, 200, {
+            id: e.id, expenseNumber: e.expense_number, description: e.description,
+            amount: parseFloat(e.amount), status: e.status
+          });
         });
       });
       return;
@@ -1479,7 +1264,7 @@ const server = http.createServer(async (req, res) => {
       await checkAuth(req, res, 'expenses', 'approve', async () => {
         const result = await query('DELETE FROM expenses WHERE id = $1 RETURNING *', [id]);
         if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-        sendJson(res, 200, { message: 'Expense deleted' });
+        sendJson(res, 200, { message: 'Deleted' });
       });
       return;
     }
@@ -1487,107 +1272,89 @@ const server = http.createServer(async (req, res) => {
     // ============ DASHBOARD ============
     if (path === '/api/v1/reports/dashboard' && method === 'GET') {
       await checkAuth(req, res, 'dashboard', 'view', async () => {
-        try {
-          const todayResult = await query(`
-            SELECT 
-              COALESCE(SUM(total), 0) as total_sales,
-              COUNT(*) as count
-            FROM sales 
-            WHERE sale_date >= CURRENT_DATE AND sale_date < CURRENT_DATE + INTERVAL '1 day'
-          `);
-          const todaySales = parseFloat(todayResult.rows[0].total_sales);
-          const todaySalesCount = parseInt(todayResult.rows[0].count);
+        const todayResult = await query(`
+          SELECT COALESCE(SUM(total), 0) as total_sales, COUNT(*) as count
+          FROM sales WHERE sale_date >= CURRENT_DATE AND sale_date < CURRENT_DATE + INTERVAL '1 day'
+        `);
+        const todaySales = parseFloat(todayResult.rows[0].total_sales);
+        const todaySalesCount = parseInt(todayResult.rows[0].count);
 
-          const todayServicesResult = await query(`
-            SELECT 
-              COALESCE(SUM(total), 0) as total_revenue,
-              COUNT(*) as count
-            FROM services 
-            WHERE received_date >= CURRENT_DATE AND received_date < CURRENT_DATE + INTERVAL '1 day'
-          `);
-          const todayServiceRevenue = parseFloat(todayServicesResult.rows[0].total_revenue);
-          const todayServicesCount = parseInt(todayServicesResult.rows[0].count);
+        const todayServicesResult = await query(`
+          SELECT COALESCE(SUM(total), 0) as total_revenue, COUNT(*) as count
+          FROM services WHERE received_date >= CURRENT_DATE AND received_date < CURRENT_DATE + INTERVAL '1 day'
+        `);
+        const todayServiceRevenue = parseFloat(todayServicesResult.rows[0].total_revenue);
+        const todayServicesCount = parseInt(todayServicesResult.rows[0].count);
 
-          const monthResult = await query(`
-            SELECT 
-              COALESCE(SUM(total), 0) as total_sales,
-              COUNT(*) as count
-            FROM sales 
-            WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE)
-          `);
-          const monthSales = parseFloat(monthResult.rows[0].total_sales);
-          const monthSalesCount = parseInt(monthResult.rows[0].count);
+        const monthResult = await query(`
+          SELECT COALESCE(SUM(total), 0) as total_sales, COUNT(*) as count
+          FROM sales WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE)
+        `);
+        const monthSales = parseFloat(monthResult.rows[0].total_sales);
+        const monthSalesCount = parseInt(monthResult.rows[0].count);
 
-          const monthServicesResult = await query(`
-            SELECT 
-              COALESCE(SUM(total), 0) as total_revenue,
-              COUNT(*) as count
-            FROM services 
-            WHERE received_date >= DATE_TRUNC('month', CURRENT_DATE)
-          `);
-          const monthServiceRevenue = parseFloat(monthServicesResult.rows[0].total_revenue);
-          const monthServicesCount = parseInt(monthServicesResult.rows[0].count);
+        const monthServicesResult = await query(`
+          SELECT COALESCE(SUM(total), 0) as total_revenue, COUNT(*) as count
+          FROM services WHERE received_date >= DATE_TRUNC('month', CURRENT_DATE)
+        `);
+        const monthServiceRevenue = parseFloat(monthServicesResult.rows[0].total_revenue);
+        const monthServicesCount = parseInt(monthServicesResult.rows[0].count);
 
-          const expensesResult = await query(`
-            SELECT COALESCE(SUM(total), 0) as total
-            FROM expenses 
-            WHERE expense_date >= CURRENT_DATE AND expense_date < CURRENT_DATE + INTERVAL '1 day'
-          `);
-          const todayExpenses = parseFloat(expensesResult.rows[0].total);
+        const expensesResult = await query(`
+          SELECT COALESCE(SUM(total), 0) as total
+          FROM expenses WHERE expense_date >= CURRENT_DATE AND expense_date < CURRENT_DATE + INTERVAL '1 day'
+        `);
+        const todayExpenses = parseFloat(expensesResult.rows[0].total);
 
-          const receivablesResult = await query('SELECT COALESCE(SUM(balance), 0) as total FROM customers');
-          const receivables = parseFloat(receivablesResult.rows[0].total);
+        const receivablesResult = await query('SELECT COALESCE(SUM(balance), 0) as total FROM customers');
+        const receivables = parseFloat(receivablesResult.rows[0].total);
 
-          const servicesOutstandingResult = await query('SELECT COALESCE(SUM(balance), 0) as total FROM services');
-          const serviceOutstanding = parseFloat(servicesOutstandingResult.rows[0].total);
+        const servicesOutstandingResult = await query('SELECT COALESCE(SUM(balance), 0) as total FROM services');
+        const serviceOutstanding = parseFloat(servicesOutstandingResult.rows[0].total);
 
-          const inventoryResult = await query('SELECT COALESCE(SUM(stock * cost_price), 0) as total FROM products');
-          const inventoryValue = parseFloat(inventoryResult.rows[0].total);
+        const inventoryResult = await query('SELECT COALESCE(SUM(stock * cost_price), 0) as total FROM products');
+        const inventoryValue = parseFloat(inventoryResult.rows[0].total);
 
-          const lowStockResult = await query('SELECT COUNT(*) FROM products WHERE stock <= reorder_level');
-          const lowStock = parseInt(lowStockResult.rows[0].count);
+        const lowStockResult = await query('SELECT COUNT(*) FROM products WHERE stock <= reorder_level');
+        const lowStock = parseInt(lowStockResult.rows[0].count);
 
-          const pendingServicesResult = await query(
-            `SELECT COUNT(*) FROM services WHERE status IN ('Received', 'In Progress', 'Waiting for Customer')`
-          );
-          const pendingServices = parseInt(pendingServicesResult.rows[0].count);
+        const pendingServicesResult = await query(
+          `SELECT COUNT(*) FROM services WHERE status IN ('Received', 'In Progress', 'Waiting for Customer')`
+        );
+        const pendingServices = parseInt(pendingServicesResult.rows[0].count);
 
-          const totalTodaySales = todaySales + todayServiceRevenue;
-          const totalTodayTransactions = todaySalesCount + todayServicesCount;
-          const totalMonthSales = monthSales + monthServiceRevenue;
-          const totalMonthTransactions = monthSalesCount + monthServicesCount;
+        const totalTodaySales = todaySales + todayServiceRevenue;
+        const totalTodayTransactions = todaySalesCount + todayServicesCount;
+        const totalMonthSales = monthSales + monthServiceRevenue;
+        const totalMonthTransactions = monthSalesCount + monthServicesCount;
 
-          const todayProfit = (todaySales * 0.3) + (todayServiceRevenue * 0.4);
-          const monthProfit = (monthSales * 0.3) + (monthServiceRevenue * 0.4);
+        const todayProfit = (todaySales * 0.3) + (todayServiceRevenue * 0.4);
+        const monthProfit = (monthSales * 0.3) + (monthServiceRevenue * 0.4);
 
-          sendJson(res, 200, {
-            todaySales: totalTodaySales,
-            todayProductSales: todaySales,
-            todayServiceRevenue: todayServiceRevenue,
-            todayProfit: todayProfit,
-            todayExpenses: todayExpenses,
-            todaySalesCount: totalTodayTransactions,
-            monthSales: totalMonthSales,
-            monthProductSales: monthSales,
-            monthServiceRevenue: monthServiceRevenue,
-            monthSalesCount: totalMonthTransactions,
-            monthProfit: monthProfit,
-            cashBalance: 45000,
-            receivables: receivables + serviceOutstanding,
-            payables: 3200,
-            inventoryValue: inventoryValue,
-            lowStock: lowStock,
-            pendingServices: pendingServices,
-          });
-        } catch (error) {
-          console.error('❌ Dashboard error:', error);
-          sendJson(res, 500, { message: 'Failed to load dashboard' });
-        }
+        sendJson(res, 200, {
+          todaySales: totalTodaySales,
+          todayProductSales: todaySales,
+          todayServiceRevenue: todayServiceRevenue,
+          todayProfit: todayProfit,
+          todayExpenses: todayExpenses,
+          todaySalesCount: totalTodayTransactions,
+          monthSales: totalMonthSales,
+          monthProductSales: monthSales,
+          monthServiceRevenue: monthServiceRevenue,
+          monthSalesCount: totalMonthTransactions,
+          monthProfit: monthProfit,
+          cashBalance: 45000,
+          receivables: receivables + serviceOutstanding,
+          payables: 3200,
+          inventoryValue: inventoryValue,
+          lowStock: lowStock,
+          pendingServices: pendingServices,
+        });
       });
       return;
     }
 
-    // ============ REPORTS: SALES BY CASHIER ============
+    // ============ ADMIN REPORTS ============
     if (path === '/api/v1/reports/sales-by-cashier' && method === 'GET') {
       await checkAuth(req, res, 'reports', 'view', async (user) => {
         if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) {
@@ -1598,14 +1365,8 @@ const server = http.createServer(async (req, res) => {
         let sql = 'SELECT * FROM sales WHERE 1=1';
         const params = [];
         
-        if (startDate) {
-          params.push(startDate);
-          sql += ` AND sale_date >= $${params.length}`;
-        }
-        if (endDate) {
-          params.push(endDate);
-          sql += ` AND sale_date <= $${params.length}`;
-        }
+        if (startDate) { params.push(startDate); sql += ` AND sale_date >= $${params.length}`; }
+        if (endDate) { params.push(endDate); sql += ` AND sale_date <= $${params.length}`; }
         
         const result = await query(sql, params);
         const cashierData = {};
@@ -1624,7 +1385,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // ============ REPORTS: DAILY SERVICES ============
     if (path === '/api/v1/reports/daily-services' && method === 'GET') {
       await checkAuth(req, res, 'reports', 'view', async (user) => {
         if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) {
@@ -1635,14 +1395,8 @@ const server = http.createServer(async (req, res) => {
         let sql = 'SELECT * FROM services WHERE 1=1';
         const params = [];
         
-        if (startDate) {
-          params.push(startDate);
-          sql += ` AND received_date >= $${params.length}`;
-        }
-        if (endDate) {
-          params.push(endDate);
-          sql += ` AND received_date <= $${params.length}`;
-        }
+        if (startDate) { params.push(startDate); sql += ` AND received_date >= $${params.length}`; }
+        if (endDate) { params.push(endDate); sql += ` AND received_date <= $${params.length}`; }
         
         const result = await query(sql, params);
         sendJson(res, 200, result.rows.map(s => ({
@@ -1662,7 +1416,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // ============ REPORTS: SERVICES BY USER ============
     if (path === '/api/v1/reports/services-by-user' && method === 'GET') {
       await checkAuth(req, res, 'reports', 'view', async (user) => {
         if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) {
@@ -1673,14 +1426,8 @@ const server = http.createServer(async (req, res) => {
         let sql = 'SELECT * FROM services WHERE 1=1';
         const params = [];
         
-        if (startDate) {
-          params.push(startDate);
-          sql += ` AND received_date >= $${params.length}`;
-        }
-        if (endDate) {
-          params.push(endDate);
-          sql += ` AND received_date <= $${params.length}`;
-        }
+        if (startDate) { params.push(startDate); sql += ` AND received_date >= $${params.length}`; }
+        if (endDate) { params.push(endDate); sql += ` AND received_date <= $${params.length}`; }
         
         const result = await query(sql, params);
         const userData = {};
@@ -1701,7 +1448,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // ============ REPORTS: USER ACTIVITY ============
     if (path === '/api/v1/reports/user-activity' && method === 'GET') {
       await checkAuth(req, res, 'reports', 'view', async (user) => {
         if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) {
@@ -1754,11 +1500,11 @@ const server = http.createServer(async (req, res) => {
 // ============ START ============
 server.listen(PORT, '0.0.0.0', async () => {
   console.log('='.repeat(50));
-  console.log('🚀 SAMI ERP BACKEND (PostgreSQL)');
+  console.log('🚀 SAMI ERP BACKEND (PostgreSQL + Brevo)');
   console.log('='.repeat(50));
   console.log(`📍 http://localhost:${PORT}`);
   console.log(`🔑 admin/admin123 | cashier/cashier123`);
-  console.log(`📧 Email: ${emailReady ? '✅ Ready' : '❌ Not configured'}`);
+  console.log(`📧 Email: ${emailReady ? '✅ Brevo Ready' : '❌ BREVO_API_KEY not set'}`);
   
   try {
     const result = await query('SELECT COUNT(*) FROM users');
