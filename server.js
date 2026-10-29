@@ -4,7 +4,7 @@ const http = require('http');
 const url = require('url');
 const crypto = require('crypto');
 const { Pool } = require('pg');
-const requestOrigin = req.headers.origin;
+
 const PORT = process.env.PORT || 3001;
 
 // ============ DATABASE CONNECTION ============
@@ -221,7 +221,7 @@ const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const path = parsedUrl.pathname;
   const method = req.method;
-
+  const requestOrigin = req.headers.origin;
   console.log(`📝 ${method} ${path}`);
 
 if (method === 'OPTIONS') {
@@ -864,15 +864,36 @@ if (method === 'OPTIONS') {
             
             let customerName = null;
             if (customerId) {
-              const custResult = await client.query('SELECT * FROM customers WHERE id = $1', [customerId]);
-              if (custResult.rows[0]) {
-                customerName = custResult.rows[0].name;
-                if (balanceDue > 0) {
-                  await client.query('UPDATE customers SET balance = balance + $1 WHERE id = $2', [balanceDue, customerId]);
-                }
-              }
-            }
-            
+  const custResult = await client.query('SELECT * FROM customers WHERE id = $1', [customerId]);
+  if (custResult.rows[0]) {
+    const customer = custResult.rows[0];
+    customerName = customer.name;
+    
+    if (balanceDue > 0) {
+      const currentBalance = parseFloat(customer.balance) || 0;
+      const creditLimit = parseFloat(customer.credit_limit) || 0;
+      const newBalance = currentBalance + balanceDue;
+      
+      // ✅ Check credit limit (only if credit limit is set and > 0)
+      if (creditLimit > 0 && newBalance > creditLimit) {
+        await client.query('ROLLBACK');
+        return sendJson(res, 400, { 
+          message: `Credit limit exceeded. ${customer.name} has ETB ${currentBalance.toFixed(2)} outstanding with a limit of ETB ${creditLimit.toFixed(2)}. This sale would bring balance to ETB ${newBalance.toFixed(2)}.`,
+          currentBalance,
+          creditLimit,
+          attemptedBalance: newBalance,
+          exceededBy: newBalance - creditLimit
+        }, origin);
+      }
+      
+      // ✅ Update balance
+      await client.query(
+        'UPDATE customers SET balance = balance + $1 WHERE id = $2', 
+        [balanceDue, customerId]
+      );
+    }
+  }
+}
             const fullName = `${user.firstName} ${user.lastName}`;
             const invoiceNumber = `INV-${new Date().getFullYear()}-${String(Date.now()).slice(-6)}`;
             
@@ -1538,3 +1559,64 @@ process.on('SIGINT', async () => {
   await pool.end();
   process.exit();
 });
+// ============ CUSTOMER STATEMENT ============
+if (path.match(/^\/api\/v1\/customers\/\d+\/statement$/) && method === 'GET') {
+  const id = parseInt(path.split('/')[3]);
+  
+  await checkAuth(req, res, 'customers', 'view', async () => {
+    try {
+      // Get customer
+      const custResult = await query('SELECT * FROM customers WHERE id = $1', [id]);
+      if (custResult.rows.length === 0) {
+        return sendJson(res, 404, { message: 'Customer not found' }, origin);
+      }
+      const customer = custResult.rows[0];
+      
+      // Get credit sales
+      const salesResult = await query(
+        `SELECT * FROM sales 
+         WHERE customer_id = $1 AND balance_due > 0
+         ORDER BY sale_date DESC`,
+        [id]
+      );
+      
+      // Calculate totals
+      const totalCredit = salesResult.rows.reduce((sum, s) => sum + parseFloat(s.balance_due), 0);
+      const totalSales = salesResult.rows.reduce((sum, s) => sum + parseFloat(s.total), 0);
+      const totalPaid = salesResult.rows.reduce((sum, s) => sum + parseFloat(s.amount_paid), 0);
+      
+      sendJson(res, 200, {
+        customer: {
+          id: customer.id,
+          name: customer.name,
+          phone: customer.phone,
+          email: customer.email,
+          balance: parseFloat(customer.balance),
+          creditLimit: parseFloat(customer.credit_limit),
+        },
+        summary: {
+          totalSales,
+          totalPaid,
+          totalOutstanding: totalCredit,
+          availableCredit: parseFloat(customer.credit_limit) - parseFloat(customer.balance),
+          transactionsCount: salesResult.rows.length,
+        },
+        transactions: salesResult.rows.map(s => ({
+          id: s.id,
+          invoiceNumber: s.invoice_number,
+          saleDate: s.sale_date,
+          saleTime: s.sale_time,
+          total: parseFloat(s.total),
+          amountPaid: parseFloat(s.amount_paid),
+          balanceDue: parseFloat(s.balance_due),
+          paymentStatus: s.payment_status,
+          items: s.items || [],
+        }))
+      }, origin);
+    } catch (error) {
+      console.error('❌ Statement error:', error);
+      sendJson(res, 500, { message: 'Failed to load statement' }, origin);
+    }
+  });
+  return;
+};
