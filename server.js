@@ -85,7 +85,6 @@ async function sendVerificationCode(toEmail, code, userName) {
 
 // ============ CORS ============
 function setCors(res, origin) {
-  // Allow your Firebase frontend and local development
   const allowedOrigins = [
     'https://sami-erp-system.web.app',
     'https://sami-erp-system.firebaseapp.com',
@@ -93,20 +92,20 @@ function setCors(res, origin) {
     'http://localhost:3000'
   ];
 
-  // If the request has an origin that is allowed, echo it back
   if (origin && allowedOrigins.includes(origin)) {
     res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    res.setHeader('Vary', 'Origin');
   } else {
-    // Fallback for non-browser requests (like curl) or unexpected origins
-    // Using '*' here is safe ONLY if credentials are not used for that request
-    res.setHeader('Access-Control-Allow-Origin', '*'); 
+    // Wildcard – cannot be combined with credentials per spec
+    res.setHeader('Access-Control-Allow-Origin', '*');
   }
 
-  res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  res.setHeader('Access-Control-Max-Age', '86400'); // Cache preflight for 24 hours
+  res.setHeader('Access-Control-Max-Age', '86400');
 }
+
 function sendJson(res, status, data, origin) {
   setCors(res, origin);
   res.writeHead(status, { 'Content-Type': 'application/json' });
@@ -178,17 +177,17 @@ function hasPermission(user, module, action) {
 async function checkAuth(req, res, module, action, callback) {
   const auth = req.headers.authorization;
   if (!auth) return sendJson(res, 401, { message: 'Authentication required' });
-  
+
   const token = auth.split(' ')[1];
   if (!token) return sendJson(res, 401, { message: 'Invalid token' });
-  
+
   const user = await getUserFromToken(token);
   if (!user) return sendJson(res, 401, { message: 'User not found' });
-  
+
   if (!hasPermission(user, module, action)) {
     return sendJson(res, 403, { message: 'Insufficient permissions' });
   }
-  
+
   await callback(user);
 }
 
@@ -221,15 +220,18 @@ const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const path = parsedUrl.pathname;
   const method = req.method;
+
+  // ✅ FIX #1: define requestOrigin ONCE at the top of the handler
   const requestOrigin = req.headers.origin;
+
   console.log(`📝 ${method} ${path}`);
 
-if (method === 'OPTIONS') {
-  setCors(res, requestOrigin);
-  res.writeHead(200);
-  res.end();
-  return;
-}
+  if (method === 'OPTIONS') {
+    setCors(res, requestOrigin);
+    res.writeHead(200);
+    res.end();
+    return;
+  }
 
   try {
     // ============ HEALTH ============
@@ -238,30 +240,30 @@ if (method === 'OPTIONS') {
         await query('SELECT 1');
         return sendJson(res, 200, { status: 'ok', emailReady, database: 'connected' }, requestOrigin);
       } catch (err) {
-        return sendJson(res, 503, { status: 'error', database: 'disconnected', message: err.message });
+        return sendJson(res, 503, { status: 'error', database: 'disconnected', message: err.message }, requestOrigin);
       }
     }
 
     // ============ LOGIN ============
     if (path === '/api/v1/auth/login' && method === 'POST') {
       parseBody(req, async (err, body) => {
-        if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-        
+        if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
         try {
           const result = await query('SELECT * FROM users WHERE username = $1', [body.username]);
           const user = result.rows[0];
-          
+
           if (!user || user.password !== body.password) {
-            return sendJson(res, 401, { message: 'Invalid credentials' });
+            return sendJson(res, 401, { message: 'Invalid credentials' }, requestOrigin);
           }
-          
+
           if (!user.active) {
-            return sendJson(res, 401, { message: 'Account inactive' });
+            return sendJson(res, 401, { message: 'Account inactive' }, requestOrigin);
           }
-          
+
           const token = generateToken(user.id);
           await query('UPDATE users SET last_login_at = NOW() WHERE id = $1', [user.id]);
-          
+
           sendJson(res, 200, {
             accessToken: token,
             refreshToken: 'refresh-' + token,
@@ -272,9 +274,9 @@ if (method === 'OPTIONS') {
               roles: user.roles || [], preferences: user.preferences || {},
               permissions: ['*']
             }
-          });
+          }, requestOrigin);
         } catch (error) {
-          sendJson(res, 500, { message: 'Login failed' });
+          sendJson(res, 500, { message: 'Login failed' }, requestOrigin);
         }
       });
       return;
@@ -283,35 +285,35 @@ if (method === 'OPTIONS') {
     // ============ REFRESH TOKEN ============
     if (path === '/api/v1/auth/refresh' && method === 'POST') {
       parseBody(req, (err) => {
-        if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
+        if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
         const token = generateToken(1);
-        sendJson(res, 200, { accessToken: token, refreshToken: 'refresh-' + token });
+        sendJson(res, 200, { accessToken: token, refreshToken: 'refresh-' + token }, requestOrigin);
       });
       return;
     }
 
     // ============ LOGOUT ============
     if (path === '/api/v1/auth/logout' && method === 'POST') {
-      sendJson(res, 200, { message: 'Logged out successfully' });
+      sendJson(res, 200, { message: 'Logged out successfully' }, requestOrigin);
       return;
     }
 
     // ============ CHANGE PASSWORD ============
     if (path === '/api/v1/auth/change-password' && method === 'POST') {
       const auth = req.headers.authorization;
-      if (!auth) return sendJson(res, 401, { message: 'Authentication required' });
+      if (!auth) return sendJson(res, 401, { message: 'Authentication required' }, requestOrigin);
       const token = auth.split(' ')[1];
       const user = await getUserFromToken(token);
-      if (!user) return sendJson(res, 401, { message: 'User not found' });
-      
+      if (!user) return sendJson(res, 401, { message: 'User not found' }, requestOrigin);
+
       parseBody(req, async (err, body) => {
-        if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-        if (!body.currentPassword) return sendJson(res, 400, { message: 'Current password required' });
-        if (user.password !== body.currentPassword) return sendJson(res, 400, { message: 'Current password incorrect' });
-        if (!body.newPassword || body.newPassword.length < 6) return sendJson(res, 400, { message: 'New password must be 6+ chars' });
-        
+        if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+        if (!body.currentPassword) return sendJson(res, 400, { message: 'Current password required' }, requestOrigin);
+        if (user.password !== body.currentPassword) return sendJson(res, 400, { message: 'Current password incorrect' }, requestOrigin);
+        if (!body.newPassword || body.newPassword.length < 6) return sendJson(res, 400, { message: 'New password must be 6+ chars' }, requestOrigin);
+
         await query('UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2', [body.newPassword, user.id]);
-        sendJson(res, 200, { message: 'Password changed', requireRelogin: true });
+        sendJson(res, 200, { message: 'Password changed', requireRelogin: true }, requestOrigin);
       });
       return;
     }
@@ -319,46 +321,46 @@ if (method === 'OPTIONS') {
     // ============ FORGOT PASSWORD - REQUEST ============
     if (path === '/api/v1/auth/forgot-password' && method === 'POST') {
       parseBody(req, async (err, body) => {
-        if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-        
+        if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
         const { username, email } = body;
-        if (!username && !email) return sendJson(res, 400, { message: 'Username or email required' });
-        
+        if (!username && !email) return sendJson(res, 400, { message: 'Username or email required' }, requestOrigin);
+
         try {
           const result = await query(
             'SELECT * FROM users WHERE username = $1 OR LOWER(email) = LOWER($2)',
             [username || '', email || '']
           );
           const user = result.rows[0];
-          
-          if (!user) return sendJson(res, 200, { message: 'If account exists, code sent.', success: true });
-          if (!user.active) return sendJson(res, 400, { message: 'Account inactive' });
-          
+
+          if (!user) return sendJson(res, 200, { message: 'If account exists, code sent.', success: true }, requestOrigin);
+          if (!user.active) return sendJson(res, 400, { message: 'Account inactive' }, requestOrigin);
+
           const roles = user.roles || [];
           if (!roles.includes('Super Admin') && !roles.includes('Manager')) {
-            return sendJson(res, 403, { message: 'Admin only' });
+            return sendJson(res, 403, { message: 'Admin only' }, requestOrigin);
           }
-          if (!user.email) return sendJson(res, 400, { message: 'No email' });
-          
+          if (!user.email) return sendJson(res, 400, { message: 'No email' }, requestOrigin);
+
           const code = Math.floor(100000 + Math.random() * 900000).toString();
-          
+
           await query(
             `INSERT INTO password_reset_codes (user_id, code, expires_at, email, attempts)
              VALUES ($1, $2, NOW() + INTERVAL '15 minutes', $3, 0)
              ON CONFLICT (user_id) DO UPDATE SET code = $2, expires_at = NOW() + INTERVAL '15 minutes', attempts = 0`,
             [user.id, code, user.email]
           );
-          
+
           const emailResult = await sendVerificationCode(user.email, code, `${user.first_name} ${user.last_name}`);
           const maskedEmail = user.email.replace(/(.{1})(.*)(@.*)/, '$1***$3');
-          
+
           if (!emailResult.success) {
-            return sendJson(res, 500, { message: 'Failed to send email' });
+            return sendJson(res, 500, { message: 'Failed to send email' }, requestOrigin);
           }
-          
-          sendJson(res, 200, { message: `Code sent to ${maskedEmail}`, success: true });
+
+          sendJson(res, 200, { message: `Code sent to ${maskedEmail}`, success: true }, requestOrigin);
         } catch (error) {
-          sendJson(res, 500, { message: 'Failed' });
+          sendJson(res, 500, { message: 'Failed' }, requestOrigin);
         }
       });
       return;
@@ -367,30 +369,30 @@ if (method === 'OPTIONS') {
     // ============ FORGOT PASSWORD - VERIFY ============
     if (path === '/api/v1/auth/verify-reset-code' && method === 'POST') {
       parseBody(req, async (err, body) => {
-        if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-        
+        if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
         const { username, code } = body;
-        if (!code) return sendJson(res, 400, { message: 'Code required' });
-        
+        if (!code) return sendJson(res, 400, { message: 'Code required' }, requestOrigin);
+
         try {
           const userResult = await query('SELECT * FROM users WHERE username = $1', [username]);
           const user = userResult.rows[0];
-          if (!user) return sendJson(res, 400, { message: 'Invalid code' });
-          
+          if (!user) return sendJson(res, 400, { message: 'Invalid code' }, requestOrigin);
+
           const resetResult = await query('SELECT * FROM password_reset_codes WHERE user_id = $1', [user.id]);
           const reset = resetResult.rows[0];
-          
-          if (!reset) return sendJson(res, 400, { message: 'No reset request' });
-          if (new Date(reset.expires_at) < new Date()) return sendJson(res, 400, { message: 'Expired' });
-          if (reset.attempts >= 5) return sendJson(res, 400, { message: 'Too many attempts' });
+
+          if (!reset) return sendJson(res, 400, { message: 'No reset request' }, requestOrigin);
+          if (new Date(reset.expires_at) < new Date()) return sendJson(res, 400, { message: 'Expired' }, requestOrigin);
+          if (reset.attempts >= 5) return sendJson(res, 400, { message: 'Too many attempts' }, requestOrigin);
           if (reset.code !== code) {
             await query('UPDATE password_reset_codes SET attempts = attempts + 1 WHERE user_id = $1', [user.id]);
-            return sendJson(res, 400, { message: 'Invalid code' });
+            return sendJson(res, 400, { message: 'Invalid code' }, requestOrigin);
           }
-          
-          sendJson(res, 200, { message: 'Verified', success: true });
+
+          sendJson(res, 200, { message: 'Verified', success: true }, requestOrigin);
         } catch (error) {
-          sendJson(res, 500, { message: 'Failed' });
+          sendJson(res, 500, { message: 'Failed' }, requestOrigin);
         }
       });
       return;
@@ -399,30 +401,30 @@ if (method === 'OPTIONS') {
     // ============ FORGOT PASSWORD - RESET ============
     if (path === '/api/v1/auth/reset-password' && method === 'POST') {
       parseBody(req, async (err, body) => {
-        if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-        
+        if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
         const { username, code, newPassword } = body;
-        if (!code || !newPassword) return sendJson(res, 400, { message: 'Code and password required' });
-        if (newPassword.length < 6) return sendJson(res, 400, { message: 'Too short' });
-        
+        if (!code || !newPassword) return sendJson(res, 400, { message: 'Code and password required' }, requestOrigin);
+        if (newPassword.length < 6) return sendJson(res, 400, { message: 'Too short' }, requestOrigin);
+
         try {
           const userResult = await query('SELECT * FROM users WHERE username = $1', [username]);
           const user = userResult.rows[0];
-          if (!user) return sendJson(res, 400, { message: 'Invalid' });
-          
+          if (!user) return sendJson(res, 400, { message: 'Invalid' }, requestOrigin);
+
           const resetResult = await query('SELECT * FROM password_reset_codes WHERE user_id = $1', [user.id]);
           const reset = resetResult.rows[0];
-          
-          if (!reset) return sendJson(res, 400, { message: 'No request' });
-          if (new Date(reset.expires_at) < new Date()) return sendJson(res, 400, { message: 'Expired' });
-          if (reset.code !== code) return sendJson(res, 400, { message: 'Invalid code' });
-          
+
+          if (!reset) return sendJson(res, 400, { message: 'No request' }, requestOrigin);
+          if (new Date(reset.expires_at) < new Date()) return sendJson(res, 400, { message: 'Expired' }, requestOrigin);
+          if (reset.code !== code) return sendJson(res, 400, { message: 'Invalid code' }, requestOrigin);
+
           await query('UPDATE users SET password = $1 WHERE id = $2', [newPassword, user.id]);
           await query('DELETE FROM password_reset_codes WHERE user_id = $1', [user.id]);
-          
-          sendJson(res, 200, { message: 'Password reset', success: true });
+
+          sendJson(res, 200, { message: 'Password reset', success: true }, requestOrigin);
         } catch (error) {
-          sendJson(res, 500, { message: 'Failed' });
+          sendJson(res, 500, { message: 'Failed' }, requestOrigin);
         }
       });
       return;
@@ -431,7 +433,7 @@ if (method === 'OPTIONS') {
     // ============ ROLES ============
     if (path === '/api/v1/roles' && method === 'GET') {
       const result = await query('SELECT * FROM roles ORDER BY id');
-      sendJson(res, 200, result.rows);
+      sendJson(res, 200, result.rows, requestOrigin);
       return;
     }
 
@@ -445,7 +447,7 @@ if (method === 'OPTIONS') {
           email: u.email, phone: u.phone, active: u.active,
           lastLoginAt: u.last_login_at, createdAt: u.created_at,
           roles: u.roles || [], permissions: ['*']
-        })));
+        })), requestOrigin);
       });
       return;
     }
@@ -453,27 +455,27 @@ if (method === 'OPTIONS') {
     if (path === '/api/v1/users' && method === 'POST') {
       await checkAuth(req, res, 'users', 'create', async () => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
           if (!body.username || !body.firstName || !body.lastName || !body.password) {
-            return sendJson(res, 400, { message: 'Missing fields' });
+            return sendJson(res, 400, { message: 'Missing fields' }, requestOrigin);
           }
-          if (body.password.length < 6) return sendJson(res, 400, { message: 'Password too short' });
-          if (!body.roles || body.roles.length === 0) return sendJson(res, 400, { message: 'Role required' });
-          
+          if (body.password.length < 6) return sendJson(res, 400, { message: 'Password too short' }, requestOrigin);
+          if (!body.roles || body.roles.length === 0) return sendJson(res, 400, { message: 'Role required' }, requestOrigin);
+
           const existing = await query('SELECT id FROM users WHERE username = $1', [body.username]);
-          if (existing.rows.length > 0) return sendJson(res, 400, { message: 'Username exists' });
-          
+          if (existing.rows.length > 0) return sendJson(res, 400, { message: 'Username exists' }, requestOrigin);
+
           const result = await query(
             `INSERT INTO users (username, password, first_name, last_name, email, phone, active, roles)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
             [body.username, body.password, body.firstName, body.lastName, body.email || null, body.phone || null, body.active !== false, body.roles]
           );
-          
+
           const u = result.rows[0];
           sendJson(res, 201, {
             id: u.id, username: u.username, firstName: u.first_name, lastName: u.last_name,
             email: u.email, phone: u.phone, active: u.active, roles: u.roles
-          });
+          }, requestOrigin);
         });
       });
       return;
@@ -483,12 +485,12 @@ if (method === 'OPTIONS') {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'users', 'edit', async () => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
           const fields = [];
           const values = [];
           let idx = 1;
-          
+
           if (body.email !== undefined) { fields.push(`email = $${idx++}`); values.push(body.email); }
           if (body.firstName) { fields.push(`first_name = $${idx++}`); values.push(body.firstName); }
           if (body.lastName) { fields.push(`last_name = $${idx++}`); values.push(body.lastName); }
@@ -496,19 +498,19 @@ if (method === 'OPTIONS') {
           if (body.active !== undefined) { fields.push(`active = $${idx++}`); values.push(body.active); }
           if (body.roles) { fields.push(`roles = $${idx++}`); values.push(body.roles); }
           if (body.password) { fields.push(`password = $${idx++}`); values.push(body.password); }
-          
-          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
+
+          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' }, requestOrigin);
           fields.push(`updated_at = NOW()`);
           values.push(id);
-          
+
           const result = await query(`UPDATE users SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
-          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-          
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
+
           const u = result.rows[0];
           sendJson(res, 200, {
             id: u.id, username: u.username, firstName: u.first_name, lastName: u.last_name,
             email: u.email, phone: u.phone, active: u.active, roles: u.roles
-          });
+          }, requestOrigin);
         });
       });
       return;
@@ -524,7 +526,7 @@ if (method === 'OPTIONS') {
           sellingPrice: parseFloat(p.selling_price), costPrice: parseFloat(p.cost_price),
           stock: p.stock, reorderLevel: p.reorder_level, reorderQuantity: p.reorder_quantity,
           active: p.active, createdAt: p.created_at
-        })));
+        })), requestOrigin);
       });
       return;
     }
@@ -533,7 +535,7 @@ if (method === 'OPTIONS') {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'products', 'view', async () => {
         const result = await query('SELECT * FROM products WHERE id = $1', [id]);
-        if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
+        if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
         const p = result.rows[0];
         sendJson(res, 200, {
           id: p.id, sku: p.sku, barcode: p.barcode, name: p.name,
@@ -541,7 +543,7 @@ if (method === 'OPTIONS') {
           sellingPrice: parseFloat(p.selling_price), costPrice: parseFloat(p.cost_price),
           stock: p.stock, reorderLevel: p.reorder_level, reorderQuantity: p.reorder_quantity,
           active: p.active, createdAt: p.created_at
-        });
+        }, requestOrigin);
       });
       return;
     }
@@ -549,8 +551,8 @@ if (method === 'OPTIONS') {
     if (path === '/api/v1/products' && method === 'POST') {
       await checkAuth(req, res, 'products', 'create', async () => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
           const result = await query(
             `INSERT INTO products (sku, barcode, name, description, brand, category, unit, selling_price, cost_price, stock, reorder_level, reorder_quantity, active)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
@@ -568,7 +570,7 @@ if (method === 'OPTIONS') {
             id: p.id, sku: p.sku, barcode: p.barcode, name: p.name,
             sellingPrice: parseFloat(p.selling_price), costPrice: parseFloat(p.cost_price),
             stock: p.stock, reorderLevel: p.reorder_level, active: p.active
-          });
+          }, requestOrigin);
         });
       });
       return;
@@ -578,12 +580,12 @@ if (method === 'OPTIONS') {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'products', 'edit', async () => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
           const fields = [];
           const values = [];
           let idx = 1;
-          
+
           const map = {
             sku: 'sku', barcode: 'barcode', name: 'name', description: 'description',
             brand: 'brand', category: 'category', unit: 'unit',
@@ -591,24 +593,24 @@ if (method === 'OPTIONS') {
             stock: 'stock', reorderLevel: 'reorder_level', reorderQuantity: 'reorder_quantity',
             active: 'active'
           };
-          
+
           for (const [key, col] of Object.entries(map)) {
             if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
           }
-          
-          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
+
+          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' }, requestOrigin);
           fields.push('updated_at = NOW()');
           values.push(id);
-          
+
           const result = await query(`UPDATE products SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
-          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-          
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
+
           const p = result.rows[0];
           sendJson(res, 200, {
             id: p.id, sku: p.sku, name: p.name,
             sellingPrice: parseFloat(p.selling_price), costPrice: parseFloat(p.cost_price),
             stock: p.stock, reorderLevel: p.reorder_level, active: p.active
-          });
+          }, requestOrigin);
         });
       });
       return;
@@ -618,8 +620,8 @@ if (method === 'OPTIONS') {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'products', 'delete', async () => {
         const result = await query('DELETE FROM products WHERE id = $1 RETURNING *', [id]);
-        if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-        sendJson(res, 200, { message: 'Deleted' });
+        if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
+        sendJson(res, 200, { message: 'Deleted' }, requestOrigin);
       });
       return;
     }
@@ -633,7 +635,7 @@ if (method === 'OPTIONS') {
           phone: c.phone, email: c.email, address: c.address,
           balance: parseFloat(c.balance), creditLimit: parseFloat(c.credit_limit),
           totalPurchases: parseFloat(c.total_purchases), active: c.active
-        })));
+        })), requestOrigin);
       });
       return;
     }
@@ -641,12 +643,12 @@ if (method === 'OPTIONS') {
     if (path === '/api/v1/customers' && method === 'POST') {
       await checkAuth(req, res, 'customers', 'create', async () => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
           const codeResult = await query("SELECT COUNT(*) FROM customers");
           const count = parseInt(codeResult.rows[0].count) + 1;
           const customerCode = `CUST-${String(count).padStart(3, '0')}`;
-          
+
           const result = await query(
             `INSERT INTO customers (customer_code, name, phone, email, address, balance, credit_limit, active)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
@@ -654,13 +656,13 @@ if (method === 'OPTIONS') {
              body.address || null, parseFloat(body.balance) || 0,
              parseFloat(body.creditLimit) || 0, body.active !== false]
           );
-          
+
           const c = result.rows[0];
           sendJson(res, 201, {
             id: c.id, customerCode: c.customer_code, name: c.name,
             phone: c.phone, email: c.email, balance: parseFloat(c.balance),
             creditLimit: parseFloat(c.credit_limit), active: c.active
-          });
+          }, requestOrigin);
         });
       });
       return;
@@ -670,35 +672,95 @@ if (method === 'OPTIONS') {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'customers', 'edit', async () => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
           const fields = [];
           const values = [];
           let idx = 1;
-          
+
           const map = {
             name: 'name', phone: 'phone', email: 'email', address: 'address',
             balance: 'balance', creditLimit: 'credit_limit', active: 'active'
           };
-          
+
           for (const [key, col] of Object.entries(map)) {
             if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
           }
-          
-          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
+
+          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' }, requestOrigin);
           fields.push('updated_at = NOW()');
           values.push(id);
-          
+
           const result = await query(`UPDATE customers SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
-          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-          
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
+
           const c = result.rows[0];
           sendJson(res, 200, {
             id: c.id, customerCode: c.customer_code, name: c.name,
             phone: c.phone, email: c.email, balance: parseFloat(c.balance),
             creditLimit: parseFloat(c.credit_limit), active: c.active
-          });
+          }, requestOrigin);
         });
+      });
+      return;
+    }
+
+    // ============ CUSTOMER STATEMENT (✅ moved INSIDE handler) ============
+    if (path.match(/^\/api\/v1\/customers\/\d+\/statement$/) && method === 'GET') {
+      // ✅ FIX #4: correct index is [4]
+      const id = parseInt(path.split('/')[4]);
+
+      await checkAuth(req, res, 'customers', 'view', async () => {
+        try {
+          const custResult = await query('SELECT * FROM customers WHERE id = $1', [id]);
+          if (custResult.rows.length === 0) {
+            return sendJson(res, 404, { message: 'Customer not found' }, requestOrigin);
+          }
+          const customer = custResult.rows[0];
+
+          const salesResult = await query(
+            `SELECT * FROM sales 
+             WHERE customer_id = $1 AND balance_due > 0
+             ORDER BY sale_date DESC`,
+            [id]
+          );
+
+          const totalCredit = salesResult.rows.reduce((sum, s) => sum + parseFloat(s.balance_due), 0);
+          const totalSales = salesResult.rows.reduce((sum, s) => sum + parseFloat(s.total), 0);
+          const totalPaid = salesResult.rows.reduce((sum, s) => sum + parseFloat(s.amount_paid), 0);
+
+          sendJson(res, 200, {
+            customer: {
+              id: customer.id,
+              name: customer.name,
+              phone: customer.phone,
+              email: customer.email,
+              balance: parseFloat(customer.balance),
+              creditLimit: parseFloat(customer.credit_limit),
+            },
+            summary: {
+              totalSales,
+              totalPaid,
+              totalOutstanding: totalCredit,
+              availableCredit: parseFloat(customer.credit_limit) - parseFloat(customer.balance),
+              transactionsCount: salesResult.rows.length,
+            },
+            transactions: salesResult.rows.map(s => ({
+              id: s.id,
+              invoiceNumber: s.invoice_number,
+              saleDate: s.sale_date,
+              saleTime: s.sale_time,
+              total: parseFloat(s.total),
+              amountPaid: parseFloat(s.amount_paid),
+              balanceDue: parseFloat(s.balance_due),
+              paymentStatus: s.payment_status,
+              items: s.items || [],
+            }))
+          }, requestOrigin);
+        } catch (error) {
+          console.error('❌ Statement error:', error);
+          sendJson(res, 500, { message: 'Failed to load statement' }, requestOrigin);
+        }
       });
       return;
     }
@@ -714,7 +776,7 @@ if (method === 'OPTIONS') {
           taxId: s.tax_id, paymentTerms: s.payment_terms,
           creditLimit: parseFloat(s.credit_limit), balance: parseFloat(s.balance),
           notes: s.notes, active: s.active
-        })));
+        })), requestOrigin);
       });
       return;
     }
@@ -722,13 +784,13 @@ if (method === 'OPTIONS') {
     if (path === '/api/v1/suppliers' && method === 'POST') {
       await checkAuth(req, res, 'suppliers', 'create', async () => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          if (!body.name) return sendJson(res, 400, { message: 'Name required' });
-          
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+          if (!body.name) return sendJson(res, 400, { message: 'Name required' }, requestOrigin);
+
           const codeResult = await query("SELECT COUNT(*) FROM suppliers");
           const count = parseInt(codeResult.rows[0].count) + 1;
           const supplierCode = `SUP-${String(count).padStart(3, '0')}`;
-          
+
           const result = await query(
             `INSERT INTO suppliers (supplier_code, name, contact_person, phone, email, address, city, country, tax_id, payment_terms, credit_limit, balance, notes, active)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
@@ -738,13 +800,13 @@ if (method === 'OPTIONS') {
              parseFloat(body.creditLimit) || 0, parseFloat(body.balance) || 0,
              body.notes || null, body.active !== false]
           );
-          
+
           const s = result.rows[0];
           sendJson(res, 201, {
             id: s.id, supplierCode: s.supplier_code, name: s.name,
             contactPerson: s.contact_person, phone: s.phone, email: s.email,
             balance: parseFloat(s.balance), active: s.active
-          });
+          }, requestOrigin);
         });
       });
       return;
@@ -754,36 +816,36 @@ if (method === 'OPTIONS') {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'suppliers', 'edit', async () => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
           const fields = [];
           const values = [];
           let idx = 1;
-          
+
           const map = {
             name: 'name', contactPerson: 'contact_person', phone: 'phone', email: 'email',
             address: 'address', city: 'city', country: 'country', taxId: 'tax_id',
             paymentTerms: 'payment_terms', creditLimit: 'credit_limit',
             balance: 'balance', notes: 'notes', active: 'active'
           };
-          
+
           for (const [key, col] of Object.entries(map)) {
             if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
           }
-          
-          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
+
+          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' }, requestOrigin);
           fields.push('updated_at = NOW()');
           values.push(id);
-          
+
           const result = await query(`UPDATE suppliers SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
-          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-          
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
+
           const s = result.rows[0];
           sendJson(res, 200, {
             id: s.id, supplierCode: s.supplier_code, name: s.name,
             contactPerson: s.contact_person, phone: s.phone, email: s.email,
             balance: parseFloat(s.balance), active: s.active
-          });
+          }, requestOrigin);
         });
       });
       return;
@@ -793,8 +855,8 @@ if (method === 'OPTIONS') {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'suppliers', 'delete', async () => {
         const result = await query('DELETE FROM suppliers WHERE id = $1 RETURNING *', [id]);
-        if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-        sendJson(res, 200, { message: 'Deleted' });
+        if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
+        sendJson(res, 200, { message: 'Deleted' }, requestOrigin);
       });
       return;
     }
@@ -814,7 +876,7 @@ if (method === 'OPTIONS') {
           amountPaid: parseFloat(s.amount_paid), balanceDue: parseFloat(s.balance_due),
           paymentStatus: s.payment_status, notes: s.notes,
           items: s.items || [], payments: s.payments || [], createdAt: s.created_at
-        })));
+        })), requestOrigin);
       });
       return;
     }
@@ -822,30 +884,30 @@ if (method === 'OPTIONS') {
     if (path === '/api/v1/sales' && method === 'POST') {
       await checkAuth(req, res, 'sales', 'create', async (user) => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
           const { items, customerId, paymentMethod, amountReceived, notes, discount } = body;
-          if (!items || items.length === 0) return sendJson(res, 400, { message: 'No items' });
-          
+          if (!items || items.length === 0) return sendJson(res, 400, { message: 'No items' }, requestOrigin);
+
           const client = await pool.connect();
           try {
             await client.query('BEGIN');
-            
+
             let subtotal = 0;
             const saleItems = [];
-            
+
             for (const item of items) {
               const prodResult = await client.query('SELECT * FROM products WHERE id = $1 FOR UPDATE', [item.productId]);
               const product = prodResult.rows[0];
               if (!product) {
                 await client.query('ROLLBACK');
-                return sendJson(res, 404, { message: `Product ${item.productId} not found` });
+                return sendJson(res, 404, { message: `Product ${item.productId} not found` }, requestOrigin);
               }
               if (product.stock < item.quantity) {
                 await client.query('ROLLBACK');
-                return sendJson(res, 400, { message: `Insufficient stock: ${product.name}` });
+                return sendJson(res, 400, { message: `Insufficient stock: ${product.name}` }, requestOrigin);
               }
-              
+
               const lineTotal = item.quantity * item.unitPrice - (item.discount || 0);
               subtotal += lineTotal;
               saleItems.push({
@@ -854,49 +916,49 @@ if (method === 'OPTIONS') {
                 unitCost: parseFloat(product.cost_price),
                 discount: item.discount || 0, tax: item.tax || 0, lineTotal
               });
-              
+
               await client.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [item.quantity, item.productId]);
             }
-            
+
             const discountAmount = discount || 0;
             const total = subtotal - discountAmount;
             const balanceDue = total - (amountReceived || 0);
-            
+
             let customerName = null;
             if (customerId) {
-  const custResult = await client.query('SELECT * FROM customers WHERE id = $1', [customerId]);
-  if (custResult.rows[0]) {
-    const customer = custResult.rows[0];
-    customerName = customer.name;
-    
-    if (balanceDue > 0) {
-      const currentBalance = parseFloat(customer.balance) || 0;
-      const creditLimit = parseFloat(customer.credit_limit) || 0;
-      const newBalance = currentBalance + balanceDue;
-      
-      // ✅ Check credit limit (only if credit limit is set and > 0)
-      if (creditLimit > 0 && newBalance > creditLimit) {
-        await client.query('ROLLBACK');
-        return sendJson(res, 400, { 
-          message: `Credit limit exceeded. ${customer.name} has ETB ${currentBalance.toFixed(2)} outstanding with a limit of ETB ${creditLimit.toFixed(2)}. This sale would bring balance to ETB ${newBalance.toFixed(2)}.`,
-          currentBalance,
-          creditLimit,
-          attemptedBalance: newBalance,
-          exceededBy: newBalance - creditLimit
-        }, origin);
-      }
-      
-      // ✅ Update balance
-      await client.query(
-        'UPDATE customers SET balance = balance + $1 WHERE id = $2', 
-        [balanceDue, customerId]
-      );
-    }
-  }
-}
+              const custResult = await client.query('SELECT * FROM customers WHERE id = $1', [customerId]);
+              if (custResult.rows[0]) {
+                const customer = custResult.rows[0];
+                customerName = customer.name;
+
+                if (balanceDue > 0) {
+                  const currentBalance = parseFloat(customer.balance) || 0;
+                  const creditLimit = parseFloat(customer.credit_limit) || 0;
+                  const newBalance = currentBalance + balanceDue;
+
+                  if (creditLimit > 0 && newBalance > creditLimit) {
+                    await client.query('ROLLBACK');
+                    // ✅ FIX #3: use requestOrigin instead of undefined `origin`
+                    return sendJson(res, 400, {
+                      message: `Credit limit exceeded. ${customer.name} has ETB ${currentBalance.toFixed(2)} outstanding with a limit of ETB ${creditLimit.toFixed(2)}. This sale would bring balance to ETB ${newBalance.toFixed(2)}.`,
+                      currentBalance,
+                      creditLimit,
+                      attemptedBalance: newBalance,
+                      exceededBy: newBalance - creditLimit
+                    }, requestOrigin);
+                  }
+
+                  await client.query(
+                    'UPDATE customers SET balance = balance + $1 WHERE id = $2',
+                    [balanceDue, customerId]
+                  );
+                }
+              }
+            }
+
             const fullName = `${user.firstName} ${user.lastName}`;
             const invoiceNumber = `INV-${new Date().getFullYear()}-${String(Date.now()).slice(-6)}`;
-            
+
             const saleResult = await client.query(
               `INSERT INTO sales (invoice_number, sale_date, sale_time, customer_id, customer_name,
                 cashier_id, cashier_name, cashier_username, created_by, created_by_name, created_by_username,
@@ -914,9 +976,9 @@ if (method === 'OPTIONS') {
                 JSON.stringify(amountReceived > 0 ? [{ paymentMethod: paymentMethod || 'Cash', amount: amountReceived }] : [])
               ]
             );
-            
+
             await client.query('COMMIT');
-            
+
             const s = saleResult.rows[0];
             const sale = {
               id: s.id, invoiceNumber: s.invoice_number, saleDate: s.sale_date, saleTime: s.sale_time,
@@ -927,11 +989,12 @@ if (method === 'OPTIONS') {
               balanceDue: parseFloat(s.balance_due), paymentStatus: s.payment_status,
               items: s.items || []
             };
-            
-            sendJson(res, 201, { ...sale, receipt: generateReceipt(sale) });
+
+            sendJson(res, 201, { ...sale, receipt: generateReceipt(sale) }, requestOrigin);
           } catch (error) {
             await client.query('ROLLBACK');
-            sendJson(res, 500, { message: 'Failed to create sale' });
+            console.error('❌ Sale error:', error);
+            sendJson(res, 500, { message: 'Failed to create sale' }, requestOrigin);
           } finally {
             client.release();
           }
@@ -944,36 +1007,36 @@ if (method === 'OPTIONS') {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'sales', 'delete', async (user) => {
         if (!user.roles.includes('Super Admin')) {
-          return sendJson(res, 403, { message: 'Super Admin only' });
+          return sendJson(res, 403, { message: 'Super Admin only' }, requestOrigin);
         }
-        
+
         const client = await pool.connect();
         try {
           await client.query('BEGIN');
-          
+
           const saleResult = await client.query('SELECT * FROM sales WHERE id = $1', [id]);
           const sale = saleResult.rows[0];
           if (!sale) {
             await client.query('ROLLBACK');
-            return sendJson(res, 404, { message: 'Not found' });
+            return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
           }
-          
+
           const items = sale.items || [];
           for (const item of items) {
             await client.query('UPDATE products SET stock = stock + $1 WHERE id = $2', [item.quantity, item.productId]);
           }
-          
+
           if (sale.customer_id && sale.balance_due > 0) {
             await client.query('UPDATE customers SET balance = balance - $1 WHERE id = $2', [sale.balance_due, sale.customer_id]);
           }
-          
+
           await client.query('DELETE FROM sales WHERE id = $1', [id]);
           await client.query('COMMIT');
-          
-          sendJson(res, 200, { message: 'Sale deleted', stockRestored: true });
+
+          sendJson(res, 200, { message: 'Sale deleted', stockRestored: true }, requestOrigin);
         } catch (error) {
           await client.query('ROLLBACK');
-          sendJson(res, 500, { message: 'Failed to delete' });
+          sendJson(res, 500, { message: 'Failed to delete' }, requestOrigin);
         } finally {
           client.release();
         }
@@ -998,7 +1061,7 @@ if (method === 'OPTIONS') {
           notes: s.notes, createdBy: s.created_by,
           createdByName: s.created_by_name, createdByUsername: s.created_by_username,
           createdAt: s.created_at
-        })));
+        })), requestOrigin);
       });
       return;
     }
@@ -1006,8 +1069,8 @@ if (method === 'OPTIONS') {
     if (path === '/api/v1/services' && method === 'POST') {
       await checkAuth(req, res, 'services', 'create', async (user) => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
           const unitPrice = parseFloat(body.unitPrice) || 0;
           const quantity = parseInt(body.quantity) || 1;
           const discount = parseFloat(body.discount) || 0;
@@ -1015,13 +1078,13 @@ if (method === 'OPTIONS') {
           const total = (unitPrice * quantity) - discount + tax;
           const amountPaid = parseFloat(body.amountPaid) || 0;
           const balance = total - amountPaid;
-          
+
           const countResult = await query('SELECT COUNT(*) FROM services');
           const count = parseInt(countResult.rows[0].count) + 1;
           const jobNumber = `SRV-${new Date().getFullYear()}-${String(count).padStart(4, '0')}`;
-          
+
           const fullName = `${user.firstName} ${user.lastName}`;
-          
+
           const result = await query(
             `INSERT INTO services (job_number, customer_id, customer_name, customer_phone,
               service_type_id, service_type, description, quantity, unit_price, discount, tax,
@@ -1041,13 +1104,13 @@ if (method === 'OPTIONS') {
               user.id, fullName, user.username
             ]
           );
-          
+
           const s = result.rows[0];
           sendJson(res, 201, {
             id: s.id, jobNumber: s.job_number, serviceType: s.service_type,
             total: parseFloat(s.total), status: s.status,
             receivedDate: s.received_date, createdAt: s.created_at
-          });
+          }, requestOrigin);
         });
       });
       return;
@@ -1057,12 +1120,12 @@ if (method === 'OPTIONS') {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'services', 'edit', async () => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
           const fields = [];
           const values = [];
           let idx = 1;
-          
+
           const map = {
             customerId: 'customer_id', customerName: 'customer_name', customerPhone: 'customer_phone',
             serviceTypeId: 'service_type_id', serviceType: 'service_type', description: 'description',
@@ -1071,23 +1134,23 @@ if (method === 'OPTIONS') {
             receivedDate: 'received_date', expectedDate: 'expected_date', completedDate: 'completed_date',
             priority: 'priority', status: 'status', notes: 'notes'
           };
-          
+
           for (const [key, col] of Object.entries(map)) {
             if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
           }
-          
-          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
+
+          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' }, requestOrigin);
           fields.push('updated_at = NOW()');
           values.push(id);
-          
+
           const result = await query(`UPDATE services SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
-          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-          
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
+
           const s = result.rows[0];
           sendJson(res, 200, {
             id: s.id, jobNumber: s.job_number, status: s.status,
             total: parseFloat(s.total), amountPaid: parseFloat(s.amount_paid)
-          });
+          }, requestOrigin);
         });
       });
       return;
@@ -1097,8 +1160,8 @@ if (method === 'OPTIONS') {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'services', 'delete', async () => {
         const result = await query('DELETE FROM services WHERE id = $1 RETURNING *', [id]);
-        if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-        sendJson(res, 200, { message: 'Deleted' });
+        if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
+        sendJson(res, 200, { message: 'Deleted' }, requestOrigin);
       });
       return;
     }
@@ -1110,7 +1173,7 @@ if (method === 'OPTIONS') {
         sendJson(res, 200, result.rows.map(t => ({
           id: t.id, name: t.name, description: t.description,
           defaultPrice: parseFloat(t.default_price), active: t.active
-        })));
+        })), requestOrigin);
       });
       return;
     }
@@ -1118,9 +1181,9 @@ if (method === 'OPTIONS') {
     if (path === '/api/v1/services/types' && method === 'POST') {
       await checkAuth(req, res, 'services', 'create', async () => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          if (!body.name) return sendJson(res, 400, { message: 'Name required' });
-          
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+          if (!body.name) return sendJson(res, 400, { message: 'Name required' }, requestOrigin);
+
           const result = await query(
             'INSERT INTO service_types (name, description, default_price, active) VALUES ($1,$2,$3,$4) RETURNING *',
             [body.name, body.description || '', parseFloat(body.defaultPrice) || 0, body.active !== false]
@@ -1129,7 +1192,7 @@ if (method === 'OPTIONS') {
           sendJson(res, 201, {
             id: t.id, name: t.name, description: t.description,
             defaultPrice: parseFloat(t.default_price), active: t.active
-          });
+          }, requestOrigin);
         });
       });
       return;
@@ -1139,28 +1202,28 @@ if (method === 'OPTIONS') {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'services', 'edit', async () => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
           const fields = [];
           const values = [];
           let idx = 1;
-          
+
           if (body.name !== undefined) { fields.push(`name = $${idx++}`); values.push(body.name); }
           if (body.description !== undefined) { fields.push(`description = $${idx++}`); values.push(body.description); }
           if (body.defaultPrice !== undefined) { fields.push(`default_price = $${idx++}`); values.push(body.defaultPrice); }
           if (body.active !== undefined) { fields.push(`active = $${idx++}`); values.push(body.active); }
-          
-          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
+
+          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' }, requestOrigin);
           values.push(id);
-          
+
           const result = await query(`UPDATE service_types SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
-          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-          
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
+
           const t = result.rows[0];
           sendJson(res, 200, {
             id: t.id, name: t.name, description: t.description,
             defaultPrice: parseFloat(t.default_price), active: t.active
-          });
+          }, requestOrigin);
         });
       });
       return;
@@ -1170,8 +1233,8 @@ if (method === 'OPTIONS') {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'services', 'delete', async () => {
         const result = await query('DELETE FROM service_types WHERE id = $1 RETURNING *', [id]);
-        if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-        sendJson(res, 200, { message: 'Deleted' });
+        if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
+        sendJson(res, 200, { message: 'Deleted' }, requestOrigin);
       });
       return;
     }
@@ -1189,7 +1252,7 @@ if (method === 'OPTIONS') {
           createdByUsername: e.created_by_username,
           approvedBy: e.approved_by, approvedByName: e.approved_by_name,
           approvedAt: e.approved_at, createdAt: e.created_at
-        })));
+        })), requestOrigin);
       });
       return;
     }
@@ -1197,17 +1260,17 @@ if (method === 'OPTIONS') {
     if (path === '/api/v1/expenses' && method === 'POST') {
       await checkAuth(req, res, 'expenses', 'create', async (user) => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
           const countResult = await query('SELECT COUNT(*) FROM expenses');
           const count = parseInt(countResult.rows[0].count) + 1;
           const expenseNumber = `EXP-${new Date().getFullYear()}-${String(count).padStart(4, '0')}`;
-          
+
           const amount = parseFloat(body.amount) || 0;
           const tax = parseFloat(body.tax) || 0;
           const total = amount + tax;
           const fullName = `${user.firstName} ${user.lastName}`;
-          
+
           const result = await query(
             `INSERT INTO expenses (expense_number, description, category, amount, tax, total,
               expense_date, payment_method, status, notes, created_by, created_by_name, created_by_username)
@@ -1219,12 +1282,12 @@ if (method === 'OPTIONS') {
               user.id, fullName, user.username
             ]
           );
-          
+
           const e = result.rows[0];
           sendJson(res, 201, {
             id: e.id, expenseNumber: e.expense_number, description: e.description,
             amount: parseFloat(e.amount), total: parseFloat(e.total), status: e.status
-          });
+          }, requestOrigin);
         });
       });
       return;
@@ -1233,27 +1296,27 @@ if (method === 'OPTIONS') {
     if (path.match(/^\/api\/v1\/expenses\/\d+\/approve$/) && method === 'PATCH') {
       const pathParts = path.split('/');
       const id = parseInt(pathParts[4]);
-      
+
       await checkAuth(req, res, 'expenses', 'approve', async (user) => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
           const status = body.status || 'Approved';
           const fullName = `${user.firstName} ${user.lastName}`;
-          
+
           const result = await query(
             `UPDATE expenses SET status = $1, approved_by = $2, approved_by_name = $3, approved_at = NOW(), updated_at = NOW()
              WHERE id = $4 RETURNING *`,
             [status, user.id, fullName, id]
           );
-          
-          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-          
+
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
+
           const e = result.rows[0];
           sendJson(res, 200, {
             id: e.id, expenseNumber: e.expense_number, status: e.status,
             approvedByName: e.approved_by_name, approvedAt: e.approved_at
-          });
+          }, requestOrigin);
         });
       });
       return;
@@ -1263,34 +1326,34 @@ if (method === 'OPTIONS') {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'expenses', 'approve', async () => {
         parseBody(req, async (err, body) => {
-          if (err) return sendJson(res, 400, { message: 'Invalid JSON' });
-          
+          if (err) return sendJson(res, 400, { message: 'Invalid JSON' }, requestOrigin);
+
           const fields = [];
           const values = [];
           let idx = 1;
-          
+
           const map = {
             description: 'description', category: 'category', amount: 'amount',
             tax: 'tax', total: 'total', expenseDate: 'expense_date',
             paymentMethod: 'payment_method', status: 'status', notes: 'notes'
           };
-          
+
           for (const [key, col] of Object.entries(map)) {
             if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
           }
-          
-          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' });
+
+          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' }, requestOrigin);
           fields.push('updated_at = NOW()');
           values.push(id);
-          
+
           const result = await query(`UPDATE expenses SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
-          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-          
+          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
+
           const e = result.rows[0];
           sendJson(res, 200, {
             id: e.id, expenseNumber: e.expense_number, description: e.description,
             amount: parseFloat(e.amount), status: e.status
-          });
+          }, requestOrigin);
         });
       });
       return;
@@ -1300,8 +1363,8 @@ if (method === 'OPTIONS') {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'expenses', 'approve', async () => {
         const result = await query('DELETE FROM expenses WHERE id = $1 RETURNING *', [id]);
-        if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' });
-        sendJson(res, 200, { message: 'Deleted' });
+        if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
+        sendJson(res, 200, { message: 'Deleted' }, requestOrigin);
       });
       return;
     }
@@ -1386,7 +1449,7 @@ if (method === 'OPTIONS') {
           inventoryValue: inventoryValue,
           lowStock: lowStock,
           pendingServices: pendingServices,
-        });
+        }, requestOrigin);
       });
       return;
     }
@@ -1395,19 +1458,19 @@ if (method === 'OPTIONS') {
     if (path === '/api/v1/reports/sales-by-cashier' && method === 'GET') {
       await checkAuth(req, res, 'reports', 'view', async (user) => {
         if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) {
-          return sendJson(res, 403, { message: 'Insufficient permissions' });
+          return sendJson(res, 403, { message: 'Insufficient permissions' }, requestOrigin);
         }
-        
+
         const { startDate, endDate } = parsedUrl.query;
         let sql = 'SELECT * FROM sales WHERE 1=1';
         const params = [];
-        
+
         if (startDate) { params.push(startDate); sql += ` AND sale_date >= $${params.length}`; }
         if (endDate) { params.push(endDate); sql += ` AND sale_date <= $${params.length}`; }
-        
+
         const result = await query(sql, params);
         const cashierData = {};
-        
+
         result.rows.forEach(sale => {
           const name = sale.created_by_name || sale.cashier_name || 'Unknown';
           if (!cashierData[name]) {
@@ -1416,8 +1479,8 @@ if (method === 'OPTIONS') {
           cashierData[name].totalSales += parseFloat(sale.total);
           cashierData[name].count += 1;
         });
-        
-        sendJson(res, 200, Object.values(cashierData));
+
+        sendJson(res, 200, Object.values(cashierData), requestOrigin);
       });
       return;
     }
@@ -1425,16 +1488,16 @@ if (method === 'OPTIONS') {
     if (path === '/api/v1/reports/daily-services' && method === 'GET') {
       await checkAuth(req, res, 'reports', 'view', async (user) => {
         if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) {
-          return sendJson(res, 403, { message: 'Insufficient permissions' });
+          return sendJson(res, 403, { message: 'Insufficient permissions' }, requestOrigin);
         }
-        
+
         const { startDate, endDate } = parsedUrl.query;
         let sql = 'SELECT * FROM services WHERE 1=1';
         const params = [];
-        
+
         if (startDate) { params.push(startDate); sql += ` AND received_date >= $${params.length}`; }
         if (endDate) { params.push(endDate); sql += ` AND received_date <= $${params.length}`; }
-        
+
         const result = await query(sql, params);
         sendJson(res, 200, result.rows.map(s => ({
           id: s.id, jobNumber: s.job_number, customerName: s.customer_name || 'Walk-in',
@@ -1448,7 +1511,7 @@ if (method === 'OPTIONS') {
           completedDate: s.completed_date, notes: s.notes,
           createdBy: s.created_by_name || s.created_by_username || 'Unknown',
           createdByUsername: s.created_by_username, createdAt: s.created_at
-        })));
+        })), requestOrigin);
       });
       return;
     }
@@ -1456,19 +1519,19 @@ if (method === 'OPTIONS') {
     if (path === '/api/v1/reports/services-by-user' && method === 'GET') {
       await checkAuth(req, res, 'reports', 'view', async (user) => {
         if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) {
-          return sendJson(res, 403, { message: 'Insufficient permissions' });
+          return sendJson(res, 403, { message: 'Insufficient permissions' }, requestOrigin);
         }
-        
+
         const { startDate, endDate } = parsedUrl.query;
         let sql = 'SELECT * FROM services WHERE 1=1';
         const params = [];
-        
+
         if (startDate) { params.push(startDate); sql += ` AND received_date >= $${params.length}`; }
         if (endDate) { params.push(endDate); sql += ` AND received_date <= $${params.length}`; }
-        
+
         const result = await query(sql, params);
         const userData = {};
-        
+
         result.rows.forEach(service => {
           const name = service.created_by_name || service.created_by_username || 'Unknown';
           if (!userData[name]) {
@@ -1479,8 +1542,8 @@ if (method === 'OPTIONS') {
           if (service.status === 'Completed' || service.status === 'Delivered') userData[name].completed += 1;
           else if (service.status !== 'Cancelled') userData[name].pending += 1;
         });
-        
-        sendJson(res, 200, Object.values(userData));
+
+        sendJson(res, 200, Object.values(userData), requestOrigin);
       });
       return;
     }
@@ -1488,27 +1551,27 @@ if (method === 'OPTIONS') {
     if (path === '/api/v1/reports/user-activity' && method === 'GET') {
       await checkAuth(req, res, 'reports', 'view', async (user) => {
         if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) {
-          return sendJson(res, 403, { message: 'Insufficient permissions' });
+          return sendJson(res, 403, { message: 'Insufficient permissions' }, requestOrigin);
         }
-        
+
         const usersResult = await query('SELECT * FROM users');
         const salesResult = await query('SELECT * FROM sales');
         const servicesResult = await query('SELECT * FROM services');
         const expensesResult = await query('SELECT * FROM expenses');
-        
+
         const activity = usersResult.rows.map(u => {
           const fullName = `${u.first_name} ${u.last_name}`;
-          const userSales = salesResult.rows.filter(s => 
+          const userSales = salesResult.rows.filter(s =>
             s.created_by_username === u.username || s.cashier_username === u.username ||
             s.created_by_name === fullName || s.cashier_name === fullName
           );
-          const userServices = servicesResult.rows.filter(s => 
+          const userServices = servicesResult.rows.filter(s =>
             s.created_by_username === u.username || s.created_by_name === fullName
           );
-          const userExpenses = expensesResult.rows.filter(e => 
+          const userExpenses = expensesResult.rows.filter(e =>
             e.created_by_username === u.username || e.created_by_name === fullName
           );
-          
+
           return {
             userId: u.id, username: u.username, fullName,
             roles: u.roles || [], active: u.active,
@@ -1518,19 +1581,19 @@ if (method === 'OPTIONS') {
             lastActivity: null, lastActivityType: null
           };
         });
-        
-        sendJson(res, 200, activity);
+
+        sendJson(res, 200, activity, requestOrigin);
       });
       return;
     }
 
     // ============ 404 ============
     console.log(`❌ Route not found: ${method} ${path}`);
-    sendJson(res, 404, { message: 'Route not found' });
+    sendJson(res, 404, { message: 'Route not found' }, requestOrigin);
 
   } catch (error) {
     console.error('❌ Unhandled error:', error);
-    sendJson(res, 500, { message: 'Internal server error' });
+    sendJson(res, 500, { message: 'Internal server error' }, requestOrigin);
   }
 });
 
@@ -1542,14 +1605,14 @@ server.listen(PORT, '0.0.0.0', async () => {
   console.log(`📍 http://localhost:${PORT}`);
   console.log(`🔑 admin/admin123 | cashier/cashier123`);
   console.log(`📧 Email: ${emailReady ? '✅ Brevo Ready' : '❌ BREVO_API_KEY not set'}`);
-  
+
   try {
     const result = await query('SELECT COUNT(*) FROM users');
     console.log(`🗄️  Database: ✅ Connected (${result.rows[0].count} users)`);
   } catch (err) {
     console.log(`🗄️  Database: ❌ ${err.message}`);
   }
-  
+
   console.log('='.repeat(50));
   console.log('✅ Server ready!');
 });
@@ -1559,64 +1622,3 @@ process.on('SIGINT', async () => {
   await pool.end();
   process.exit();
 });
-// ============ CUSTOMER STATEMENT ============
-if (path.match(/^\/api\/v1\/customers\/\d+\/statement$/) && method === 'GET') {
-  const id = parseInt(path.split('/')[3]);
-  
-  await checkAuth(req, res, 'customers', 'view', async () => {
-    try {
-      // Get customer
-      const custResult = await query('SELECT * FROM customers WHERE id = $1', [id]);
-      if (custResult.rows.length === 0) {
-        return sendJson(res, 404, { message: 'Customer not found' }, origin);
-      }
-      const customer = custResult.rows[0];
-      
-      // Get credit sales
-      const salesResult = await query(
-        `SELECT * FROM sales 
-         WHERE customer_id = $1 AND balance_due > 0
-         ORDER BY sale_date DESC`,
-        [id]
-      );
-      
-      // Calculate totals
-      const totalCredit = salesResult.rows.reduce((sum, s) => sum + parseFloat(s.balance_due), 0);
-      const totalSales = salesResult.rows.reduce((sum, s) => sum + parseFloat(s.total), 0);
-      const totalPaid = salesResult.rows.reduce((sum, s) => sum + parseFloat(s.amount_paid), 0);
-      
-      sendJson(res, 200, {
-        customer: {
-          id: customer.id,
-          name: customer.name,
-          phone: customer.phone,
-          email: customer.email,
-          balance: parseFloat(customer.balance),
-          creditLimit: parseFloat(customer.credit_limit),
-        },
-        summary: {
-          totalSales,
-          totalPaid,
-          totalOutstanding: totalCredit,
-          availableCredit: parseFloat(customer.credit_limit) - parseFloat(customer.balance),
-          transactionsCount: salesResult.rows.length,
-        },
-        transactions: salesResult.rows.map(s => ({
-          id: s.id,
-          invoiceNumber: s.invoice_number,
-          saleDate: s.sale_date,
-          saleTime: s.sale_time,
-          total: parseFloat(s.total),
-          amountPaid: parseFloat(s.amount_paid),
-          balanceDue: parseFloat(s.balance_due),
-          paymentStatus: s.payment_status,
-          items: s.items || [],
-        }))
-      }, origin);
-    } catch (error) {
-      console.error('❌ Statement error:', error);
-      sendJson(res, 500, { message: 'Failed to load statement' }, origin);
-    }
-  });
-  return;
-};
