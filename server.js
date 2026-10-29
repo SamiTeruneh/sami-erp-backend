@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 
 const PORT = process.env.PORT || 3001;
+const BUILD_VERSION = '2024-06-cors-fix-v1';
 
 // ============ DATABASE CONNECTION ============
 const pool = new Pool({
@@ -92,12 +93,16 @@ function setCors(res, origin) {
     'http://localhost:3000'
   ];
 
-  if (origin && allowedOrigins.includes(origin)) {
+  // Always tell caches that the response varies by Origin
+  res.setHeader('Vary', 'Origin');
+
+  if (origin) {
+    // Echo the origin back — safe for bearer-token auth
+    // (CSRF concerns don't apply when using Authorization headers)
     res.setHeader('Access-Control-Allow-Origin', origin);
     res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Vary', 'Origin');
   } else {
-    // Wildcard – cannot be combined with credentials per spec
+    // No Origin header (curl, server-to-server) — wildcard is safe here
     res.setHeader('Access-Control-Allow-Origin', '*');
   }
 
@@ -175,17 +180,19 @@ function hasPermission(user, module, action) {
 }
 
 async function checkAuth(req, res, module, action, callback) {
+  const origin = req.headers.origin;  // ✅ grab origin for every error response
   const auth = req.headers.authorization;
-  if (!auth) return sendJson(res, 401, { message: 'Authentication required' });
+
+  if (!auth) return sendJson(res, 401, { message: 'Authentication required' }, origin);
 
   const token = auth.split(' ')[1];
-  if (!token) return sendJson(res, 401, { message: 'Invalid token' });
+  if (!token) return sendJson(res, 401, { message: 'Invalid token' }, origin);
 
   const user = await getUserFromToken(token);
-  if (!user) return sendJson(res, 401, { message: 'User not found' });
+  if (!user) return sendJson(res, 401, { message: 'User not found' }, origin);
 
   if (!hasPermission(user, module, action)) {
-    return sendJson(res, 403, { message: 'Insufficient permissions' });
+    return sendJson(res, 403, { message: 'Insufficient permissions' }, origin);
   }
 
   await callback(user);
@@ -220,28 +227,37 @@ const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
   const path = parsedUrl.pathname;
   const method = req.method;
-
-  // ✅ FIX #1: define requestOrigin ONCE at the top of the handler
   const requestOrigin = req.headers.origin;
 
-  console.log(`📝 ${method} ${path}`);
-
-  if (method === 'OPTIONS') {
-    setCors(res, requestOrigin);
-    res.writeHead(200);
-    res.end();
-    return;
-  }
+  console.log(`📝 ${method} ${path} from ${requestOrigin || 'no-origin'}`);
 
   try {
+    // ============ CORS PREFLIGHT (inside try — never throws outside) ============
+    if (method === 'OPTIONS') {
+      setCors(res, requestOrigin);
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
     // ============ HEALTH ============
     if (path === '/api/v1/health' && method === 'GET') {
       try {
         await query('SELECT 1');
-        return sendJson(res, 200, { status: 'ok', emailReady, database: 'connected' }, requestOrigin);
+        return sendJson(res, 200, { status: 'ok', emailReady, database: 'connected', version: BUILD_VERSION }, requestOrigin);
       } catch (err) {
         return sendJson(res, 503, { status: 'error', database: 'disconnected', message: err.message }, requestOrigin);
       }
+    }
+
+    // ============ VERSION (proves which build is deployed) ============
+    if (path === '/api/v1/version' && method === 'GET') {
+      return sendJson(res, 200, {
+        version: BUILD_VERSION,
+        requestOrigin: requestOrigin || null,
+        corsEcho: requestOrigin || '*',
+        timestamp: new Date().toISOString()
+      }, requestOrigin);
     }
 
     // ============ LOGIN ============
@@ -705,11 +721,9 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // ============ CUSTOMER STATEMENT (✅ moved INSIDE handler) ============
+    // ============ CUSTOMER STATEMENT ============
     if (path.match(/^\/api\/v1\/customers\/\d+\/statement$/) && method === 'GET') {
-      // ✅ FIX #4: correct index is [4]
       const id = parseInt(path.split('/')[4]);
-
       await checkAuth(req, res, 'customers', 'view', async () => {
         try {
           const custResult = await query('SELECT * FROM customers WHERE id = $1', [id]);
@@ -938,7 +952,6 @@ const server = http.createServer(async (req, res) => {
 
                   if (creditLimit > 0 && newBalance > creditLimit) {
                     await client.query('ROLLBACK');
-                    // ✅ FIX #3: use requestOrigin instead of undefined `origin`
                     return sendJson(res, 400, {
                       message: `Credit limit exceeded. ${customer.name} has ETB ${currentBalance.toFixed(2)} outstanding with a limit of ETB ${creditLimit.toFixed(2)}. This sale would bring balance to ETB ${newBalance.toFixed(2)}.`,
                       currentBalance,
@@ -1601,6 +1614,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, '0.0.0.0', async () => {
   console.log('='.repeat(50));
   console.log('🚀 SAMI ERP BACKEND (PostgreSQL + Brevo)');
+  console.log(`📦 Build: ${BUILD_VERSION}`);
   console.log('='.repeat(50));
   console.log(`📍 http://localhost:${PORT}`);
   console.log(`🔑 admin/admin123 | cashier/cashier123`);
