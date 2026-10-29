@@ -6,49 +6,129 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 
 const PORT = process.env.PORT || 3001;
-const BUILD_VERSION = '2024-06-cors-fix-v2';
+const BUILD_VERSION = '2024-06-cors-fix-v3';
 
+// ============ DATABASE CONNECTION ============
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
-  max: 10, idleTimeoutMillis: 30000, connectionTimeoutMillis: 10000,
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
 });
 
-pool.on('error', (err) => console.error('❌ Postgres pool error:', err.message));
+pool.on('error', (err) => {
+  console.error('❌ Postgres pool error:', err.message);
+});
 
 async function query(text, params) {
-  try { return await pool.query(text, params); }
-  catch (err) { console.error('❌ DB Query Error:', err.message); throw err; }
+  try {
+    const result = await pool.query(text, params);
+    return result;
+  } catch (err) {
+    console.error('❌ DB Query Error:', err.message);
+    throw err;
+  }
 }
 
-// ============ EMAIL ============
+// ============ SEQUENTIAL NUMBER HELPERS ============
+// Generates <PREFIX>-<YEAR>-<NNNN> (or <PREFIX>-<NNN> if year === null)
+// by reading the MAX existing number for the relevant period, then
+// retrying on unique-constraint collisions. This is the correct pattern —
+// COUNT(*)+1 breaks the moment any row is deleted.
+async function insertWithUniqueNumber({ table, column, prefix, pad = 4, year = new Date().getFullYear(), buildRow }) {
+  const yearPart = year === null ? '' : `-${year}`;
+  const pattern = `${prefix}${yearPart}-%`;
+  const regex = year === null
+    ? new RegExp(`^${prefix}-(\\d+)$`)
+    : new RegExp(`^${prefix}-\\d{4}-(\\d+)$`);
+  const makeNum = (n) =>
+    year === null
+      ? `${prefix}-${String(n).padStart(pad, '0')}`
+      : `${prefix}-${year}-${String(n).padStart(pad, '0')}`;
+
+  const fetchMax = async () => {
+    const r = await query(
+      `SELECT ${column} AS n FROM ${table}
+       WHERE ${column} LIKE $1
+       ORDER BY LENGTH(${column}) DESC, ${column} DESC
+       LIMIT 1`,
+      [pattern]
+    );
+    if (!r.rows[0]?.n) return 0;
+    const m = String(r.rows[0].n).match(regex);
+    return m ? parseInt(m[1], 10) : 0;
+  };
+
+  let next = (await fetchMax()) + 1;
+  let lastErr;
+
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const num = makeNum(next);
+    try {
+      return await buildRow(num);
+    } catch (err) {
+      lastErr = err;
+      const isNumberCollision =
+        err.code === '23505' &&
+        (err.constraint?.includes(column) || err.detail?.includes(column));
+      if (isNumberCollision && attempt < 19) {
+        // Re-read the max in case another request got there first
+        next = (await fetchMax()) + 1;
+        // Ensure we always move forward even if re-read didn't change
+        if (makeNum(next) === num) next = next + 1;
+        console.warn(`⚠️  ${column} collision on ${num}, retrying with ${makeNum(next)}...`);
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastErr || new Error(`Failed to allocate unique ${column} after 20 attempts`);
+}
+
+// ============ EMAIL (Brevo HTTPS API) ============
 let emailReady = !!(process.env.BREVO_API_KEY);
 if (emailReady) console.log('✅ Brevo email configured');
 else console.log('⚠️  BREVO_API_KEY not set');
 
 async function sendVerificationCode(toEmail, code, userName) {
   const BREVO_API_KEY = process.env.BREVO_API_KEY;
-  if (!BREVO_API_KEY) { console.log('⚠️  Code (dev):', code); return { success: false, error: 'Email not configured', code }; }
+  if (!BREVO_API_KEY) {
+    console.log('⚠️  Code (dev):', code);
+    return { success: false, error: 'Email not configured', code };
+  }
   try {
     const response = await fetch('https://api.brevo.com/v3/smtp/email', {
       method: 'POST',
-      headers: { 'accept': 'application/json', 'api-key': BREVO_API_KEY, 'content-type': 'application/json' },
+      headers: {
+        'accept': 'application/json',
+        'api-key': BREVO_API_KEY,
+        'content-type': 'application/json'
+      },
       body: JSON.stringify({
         sender: { name: 'SAMI ERP', email: process.env.BREVO_SENDER_EMAIL || 'samsonteruneh@gmail.com' },
         to: [{ email: toEmail }],
         subject: '🔐 Password Reset Code - SAMI ERP',
-        htmlContent: `<div style="font-family: sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
-          <h2 style="color: #1E40AF;">SAMI ERP - Password Reset</h2>
-          <p>Hello <strong>${userName}</strong>,</p><p>Your code:</p>
-          <div style="background: #EFF6FF; border: 2px dashed #3B82F6; padding: 24px; text-align: center; margin: 20px 0;">
-            <p style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #1E40AF; margin: 0; font-family: monospace;">${code}</p>
-          </div><p>Expires in <strong>15 minutes</strong>.</p></div>`
+        htmlContent: `
+          <div style="font-family: sans-serif; max-width: 500px; margin: 0 auto; padding: 20px;">
+            <h2 style="color: #1E40AF;">SAMI ERP - Password Reset</h2>
+            <p>Hello <strong>${userName}</strong>,</p>
+            <p>Your code:</p>
+            <div style="background: #EFF6FF; border: 2px dashed #3B82F6; padding: 24px; text-align: center; margin: 20px 0;">
+              <p style="font-size: 32px; font-weight: bold; letter-spacing: 8px; color: #1E40AF; margin: 0; font-family: monospace;">${code}</p>
+            </div>
+            <p>Expires in <strong>15 minutes</strong>.</p>
+          </div>
+        `
       })
     });
     if (!response.ok) throw new Error(await response.text());
     console.log('📧 Email sent:', toEmail);
     return { success: true };
-  } catch (error) { console.error('❌ Brevo error:', error.message); return { success: false, error: error.message }; }
+  } catch (error) {
+    console.error('❌ Brevo error:', error.message);
+    return { success: false, error: error.message };
+  }
 }
 
 // ============ CORS ============
@@ -72,7 +152,7 @@ function sendJson(res, status, data, origin) {
   res.end(JSON.stringify(data));
 }
 
-// ✅ THE FIX — parseBody now catches callback errors and always sends a response
+// ✅ parseBody now catches handler errors and always sends a response
 function parseBody(req, res, requestOrigin, callback) {
   let body = '';
   req.on('data', chunk => body += chunk);
@@ -162,12 +242,18 @@ async function checkAuth(req, res, module, action, callback) {
   await callback(user);
 }
 
+// ============ RECEIPT ============
 function generateReceipt(sale) {
   const lines = [
-    '=================================', '     SAMI STATIONARY', '     Addis Ababa, Ethiopia',
-    '=================================', `Invoice: ${sale.invoiceNumber}`,
-    `Date: ${new Date(sale.saleDate).toLocaleDateString()}`, `Time: ${sale.saleTime}`,
-    `Cashier: ${sale.cashierName || 'Unknown'}`, '---------------------------------',
+    '=================================',
+    '     SAMI STATIONARY',
+    '     Addis Ababa, Ethiopia',
+    '=================================',
+    `Invoice: ${sale.invoiceNumber}`,
+    `Date: ${new Date(sale.saleDate).toLocaleDateString()}`,
+    `Time: ${sale.saleTime}`,
+    `Cashier: ${sale.cashierName || 'Unknown'}`,
+    '---------------------------------',
   ];
   for (const item of sale.items) {
     const name = (item.productNameSnapshot || 'Product').substring(0, 12);
@@ -190,6 +276,7 @@ const server = http.createServer(async (req, res) => {
   console.log(`📝 ${method} ${path} from ${requestOrigin || 'no-origin'}`);
 
   try {
+    // ============ CORS PREFLIGHT ============
     if (method === 'OPTIONS') {
       setCors(res, requestOrigin);
       res.writeHead(204);
@@ -208,7 +295,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (path === '/api/v1/version' && method === 'GET') {
-      return sendJson(res, 200, { version: BUILD_VERSION, requestOrigin: requestOrigin || null, timestamp: new Date().toISOString() }, requestOrigin);
+      return sendJson(res, 200, {
+        version: BUILD_VERSION,
+        requestOrigin: requestOrigin || null,
+        timestamp: new Date().toISOString()
+      }, requestOrigin);
     }
 
     // ============ LOGIN ============
@@ -217,15 +308,24 @@ const server = http.createServer(async (req, res) => {
         try {
           const result = await query('SELECT * FROM users WHERE username = $1', [body.username]);
           const user = result.rows[0];
-          if (!user || user.password !== body.password) return sendJson(res, 401, { message: 'Invalid credentials' }, requestOrigin);
-          if (!user.active) return sendJson(res, 401, { message: 'Account inactive' }, requestOrigin);
-
+          if (!user || user.password !== body.password) {
+            return sendJson(res, 401, { message: 'Invalid credentials' }, requestOrigin);
+          }
+          if (!user.active) {
+            return sendJson(res, 401, { message: 'Account inactive' }, requestOrigin);
+          }
           const token = generateToken(user.id);
           await query('UPDATE users SET last_login_at = NOW() WHERE id = $1', [user.id]);
           sendJson(res, 200, {
-            accessToken: token, refreshToken: 'refresh-' + token,
-            user: { id: user.id, username: user.username, firstName: user.first_name, lastName: user.last_name,
-              email: user.email, phone: user.phone, roles: user.roles || [], preferences: user.preferences || {}, permissions: ['*'] }
+            accessToken: token,
+            refreshToken: 'refresh-' + token,
+            user: {
+              id: user.id, username: user.username,
+              firstName: user.first_name, lastName: user.last_name,
+              email: user.email, phone: user.phone,
+              roles: user.roles || [], preferences: user.preferences || {},
+              permissions: ['*']
+            }
           }, requestOrigin);
         } catch (error) {
           sendJson(res, 500, { message: 'Login failed', detail: error.message }, requestOrigin);
@@ -234,6 +334,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ============ REFRESH TOKEN ============
     if (path === '/api/v1/auth/refresh' && method === 'POST') {
       parseBody(req, res, requestOrigin, async () => {
         const token = generateToken(1);
@@ -242,11 +343,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ============ LOGOUT ============
     if (path === '/api/v1/auth/logout' && method === 'POST') {
       sendJson(res, 200, { message: 'Logged out successfully' }, requestOrigin);
       return;
     }
 
+    // ============ CHANGE PASSWORD ============
     if (path === '/api/v1/auth/change-password' && method === 'POST') {
       const auth = req.headers.authorization;
       if (!auth) return sendJson(res, 401, { message: 'Authentication required' }, requestOrigin);
@@ -263,19 +366,24 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // ============ FORGOT PASSWORD ============
+    // ============ FORGOT PASSWORD - REQUEST ============
     if (path === '/api/v1/auth/forgot-password' && method === 'POST') {
       parseBody(req, res, requestOrigin, async (err, body) => {
         const { username, email } = body;
         if (!username && !email) return sendJson(res, 400, { message: 'Username or email required' }, requestOrigin);
 
-        const result = await query('SELECT * FROM users WHERE username = $1 OR LOWER(email) = LOWER($2)', [username || '', email || '']);
+        const result = await query(
+          'SELECT * FROM users WHERE username = $1 OR LOWER(email) = LOWER($2)',
+          [username || '', email || '']
+        );
         const user = result.rows[0];
+
         if (!user) return sendJson(res, 200, { message: 'If account exists, code sent.', success: true }, requestOrigin);
         if (!user.active) return sendJson(res, 400, { message: 'Account inactive' }, requestOrigin);
-
         const roles = user.roles || [];
-        if (!roles.includes('Super Admin') && !roles.includes('Manager')) return sendJson(res, 403, { message: 'Admin only' }, requestOrigin);
+        if (!roles.includes('Super Admin') && !roles.includes('Manager')) {
+          return sendJson(res, 403, { message: 'Admin only' }, requestOrigin);
+        }
         if (!user.email) return sendJson(res, 400, { message: 'No email' }, requestOrigin);
 
         const code = Math.floor(100000 + Math.random() * 900000).toString();
@@ -293,13 +401,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ============ FORGOT PASSWORD - VERIFY ============
     if (path === '/api/v1/auth/verify-reset-code' && method === 'POST') {
       parseBody(req, res, requestOrigin, async (err, body) => {
         if (!body.code) return sendJson(res, 400, { message: 'Code required' }, requestOrigin);
         const userResult = await query('SELECT * FROM users WHERE username = $1', [body.username]);
         const user = userResult.rows[0];
         if (!user) return sendJson(res, 400, { message: 'Invalid code' }, requestOrigin);
-
         const resetResult = await query('SELECT * FROM password_reset_codes WHERE user_id = $1', [user.id]);
         const reset = resetResult.rows[0];
         if (!reset) return sendJson(res, 400, { message: 'No reset request' }, requestOrigin);
@@ -314,6 +422,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ============ FORGOT PASSWORD - RESET ============
     if (path === '/api/v1/auth/reset-password' && method === 'POST') {
       parseBody(req, res, requestOrigin, async (err, body) => {
         if (!body.code || !body.newPassword) return sendJson(res, 400, { message: 'Code and password required' }, requestOrigin);
@@ -321,13 +430,11 @@ const server = http.createServer(async (req, res) => {
         const userResult = await query('SELECT * FROM users WHERE username = $1', [body.username]);
         const user = userResult.rows[0];
         if (!user) return sendJson(res, 400, { message: 'Invalid' }, requestOrigin);
-
         const resetResult = await query('SELECT * FROM password_reset_codes WHERE user_id = $1', [user.id]);
         const reset = resetResult.rows[0];
         if (!reset) return sendJson(res, 400, { message: 'No request' }, requestOrigin);
         if (new Date(reset.expires_at) < new Date()) return sendJson(res, 400, { message: 'Expired' }, requestOrigin);
         if (reset.code !== body.code) return sendJson(res, 400, { message: 'Invalid code' }, requestOrigin);
-
         await query('UPDATE users SET password = $1 WHERE id = $2', [body.newPassword, user.id]);
         await query('DELETE FROM password_reset_codes WHERE user_id = $1', [user.id]);
         sendJson(res, 200, { message: 'Password reset', success: true }, requestOrigin);
@@ -347,9 +454,11 @@ const server = http.createServer(async (req, res) => {
       await checkAuth(req, res, 'users', 'view', async () => {
         const result = await query('SELECT * FROM users ORDER BY id');
         sendJson(res, 200, result.rows.map(u => ({
-          id: u.id, username: u.username, firstName: u.first_name, lastName: u.last_name,
+          id: u.id, username: u.username,
+          firstName: u.first_name, lastName: u.last_name,
           email: u.email, phone: u.phone, active: u.active,
-          lastLoginAt: u.last_login_at, createdAt: u.created_at, roles: u.roles || [], permissions: ['*']
+          lastLoginAt: u.last_login_at, createdAt: u.created_at,
+          roles: u.roles || [], permissions: ['*']
         })), requestOrigin);
       });
       return;
@@ -358,18 +467,23 @@ const server = http.createServer(async (req, res) => {
     if (path === '/api/v1/users' && method === 'POST') {
       await checkAuth(req, res, 'users', 'create', async () => {
         parseBody(req, res, requestOrigin, async (err, body) => {
-          if (!body.username || !body.firstName || !body.lastName || !body.password) return sendJson(res, 400, { message: 'Missing fields' }, requestOrigin);
+          if (!body.username || !body.firstName || !body.lastName || !body.password) {
+            return sendJson(res, 400, { message: 'Missing fields' }, requestOrigin);
+          }
           if (body.password.length < 6) return sendJson(res, 400, { message: 'Password too short' }, requestOrigin);
           if (!body.roles || body.roles.length === 0) return sendJson(res, 400, { message: 'Role required' }, requestOrigin);
           const existing = await query('SELECT id FROM users WHERE username = $1', [body.username]);
           if (existing.rows.length > 0) return sendJson(res, 400, { message: 'Username exists' }, requestOrigin);
           const result = await query(
             `INSERT INTO users (username, password, first_name, last_name, email, phone, active, roles)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
             [body.username, body.password, body.firstName, body.lastName, body.email || null, body.phone || null, body.active !== false, body.roles]
           );
           const u = result.rows[0];
-          sendJson(res, 201, { id: u.id, username: u.username, firstName: u.first_name, lastName: u.last_name, email: u.email, phone: u.phone, active: u.active, roles: u.roles }, requestOrigin);
+          sendJson(res, 201, {
+            id: u.id, username: u.username, firstName: u.first_name, lastName: u.last_name,
+            email: u.email, phone: u.phone, active: u.active, roles: u.roles
+          }, requestOrigin);
         });
       });
       return;
@@ -379,7 +493,9 @@ const server = http.createServer(async (req, res) => {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'users', 'edit', async () => {
         parseBody(req, res, requestOrigin, async (err, body) => {
-          const fields = []; const values = []; let idx = 1;
+          const fields = [];
+          const values = [];
+          let idx = 1;
           if (body.email !== undefined) { fields.push(`email = $${idx++}`); values.push(body.email); }
           if (body.firstName) { fields.push(`first_name = $${idx++}`); values.push(body.firstName); }
           if (body.lastName) { fields.push(`last_name = $${idx++}`); values.push(body.lastName); }
@@ -388,11 +504,15 @@ const server = http.createServer(async (req, res) => {
           if (body.roles) { fields.push(`roles = $${idx++}`); values.push(body.roles); }
           if (body.password) { fields.push(`password = $${idx++}`); values.push(body.password); }
           if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' }, requestOrigin);
-          fields.push(`updated_at = NOW()`); values.push(id);
+          fields.push(`updated_at = NOW()`);
+          values.push(id);
           const result = await query(`UPDATE users SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
           if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
           const u = result.rows[0];
-          sendJson(res, 200, { id: u.id, username: u.username, firstName: u.first_name, lastName: u.last_name, email: u.email, phone: u.phone, active: u.active, roles: u.roles }, requestOrigin);
+          sendJson(res, 200, {
+            id: u.id, username: u.username, firstName: u.first_name, lastName: u.last_name,
+            email: u.email, phone: u.phone, active: u.active, roles: u.roles
+          }, requestOrigin);
         });
       });
       return;
@@ -403,8 +523,8 @@ const server = http.createServer(async (req, res) => {
       await checkAuth(req, res, 'products', 'view', async () => {
         const result = await query('SELECT * FROM products ORDER BY id');
         sendJson(res, 200, result.rows.map(p => ({
-          id: p.id, sku: p.sku, barcode: p.barcode, name: p.name, description: p.description,
-          brand: p.brand, category: p.category, unit: p.unit,
+          id: p.id, sku: p.sku, barcode: p.barcode, name: p.name,
+          description: p.description, brand: p.brand, category: p.category, unit: p.unit,
           sellingPrice: parseFloat(p.selling_price), costPrice: parseFloat(p.cost_price),
           stock: p.stock, reorderLevel: p.reorder_level, reorderQuantity: p.reorder_quantity,
           active: p.active, createdAt: p.created_at
@@ -419,11 +539,13 @@ const server = http.createServer(async (req, res) => {
         const result = await query('SELECT * FROM products WHERE id = $1', [id]);
         if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
         const p = result.rows[0];
-        sendJson(res, 200, { id: p.id, sku: p.sku, barcode: p.barcode, name: p.name, description: p.description,
-          brand: p.brand, category: p.category, unit: p.unit,
+        sendJson(res, 200, {
+          id: p.id, sku: p.sku, barcode: p.barcode, name: p.name,
+          description: p.description, brand: p.brand, category: p.category, unit: p.unit,
           sellingPrice: parseFloat(p.selling_price), costPrice: parseFloat(p.cost_price),
           stock: p.stock, reorderLevel: p.reorder_level, reorderQuantity: p.reorder_quantity,
-          active: p.active, createdAt: p.created_at }, requestOrigin);
+          active: p.active, createdAt: p.created_at
+        }, requestOrigin);
       });
       return;
     }
@@ -434,16 +556,21 @@ const server = http.createServer(async (req, res) => {
           const result = await query(
             `INSERT INTO products (sku, barcode, name, description, brand, category, unit, selling_price, cost_price, stock, reorder_level, reorder_quantity, active)
              VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-            [body.sku || `PRD-${Date.now()}`, body.barcode || '', body.name, body.description || '',
-             body.brand || '', body.category || '', body.unit || 'Piece',
-             parseFloat(body.sellingPrice) || 0, parseFloat(body.costPrice) || 0,
-             parseInt(body.stock) || 0, parseInt(body.reorderLevel) || 0,
-             parseInt(body.reorderQuantity) || 0, body.active !== false]
+            [
+              body.sku || `PRD-${Date.now()}`,
+              body.barcode || '', body.name, body.description || '',
+              body.brand || '', body.category || '', body.unit || 'Piece',
+              parseFloat(body.sellingPrice) || 0, parseFloat(body.costPrice) || 0,
+              parseInt(body.stock) || 0, parseInt(body.reorderLevel) || 0,
+              parseInt(body.reorderQuantity) || 0, body.active !== false
+            ]
           );
           const p = result.rows[0];
-          sendJson(res, 201, { id: p.id, sku: p.sku, barcode: p.barcode, name: p.name,
+          sendJson(res, 201, {
+            id: p.id, sku: p.sku, barcode: p.barcode, name: p.name,
             sellingPrice: parseFloat(p.selling_price), costPrice: parseFloat(p.cost_price),
-            stock: p.stock, reorderLevel: p.reorder_level, active: p.active }, requestOrigin);
+            stock: p.stock, reorderLevel: p.reorder_level, active: p.active
+          }, requestOrigin);
         });
       });
       return;
@@ -453,18 +580,30 @@ const server = http.createServer(async (req, res) => {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'products', 'edit', async () => {
         parseBody(req, res, requestOrigin, async (err, body) => {
-          const fields = []; const values = []; let idx = 1;
-          const map = { sku: 'sku', barcode: 'barcode', name: 'name', description: 'description', brand: 'brand', category: 'category', unit: 'unit',
-            sellingPrice: 'selling_price', costPrice: 'cost_price', stock: 'stock', reorderLevel: 'reorder_level', reorderQuantity: 'reorder_quantity', active: 'active' };
+          const fields = [];
+          const values = [];
+          let idx = 1;
+          const map = {
+            sku: 'sku', barcode: 'barcode', name: 'name', description: 'description',
+            brand: 'brand', category: 'category', unit: 'unit',
+            sellingPrice: 'selling_price', costPrice: 'cost_price',
+            stock: 'stock', reorderLevel: 'reorder_level', reorderQuantity: 'reorder_quantity',
+            active: 'active'
+          };
           for (const [key, col] of Object.entries(map)) {
             if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
           }
           if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' }, requestOrigin);
-          fields.push('updated_at = NOW()'); values.push(id);
+          fields.push('updated_at = NOW()');
+          values.push(id);
           const result = await query(`UPDATE products SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
           if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
           const p = result.rows[0];
-          sendJson(res, 200, { id: p.id, sku: p.sku, name: p.name, sellingPrice: parseFloat(p.selling_price), costPrice: parseFloat(p.cost_price), stock: p.stock, reorderLevel: p.reorder_level, active: p.active }, requestOrigin);
+          sendJson(res, 200, {
+            id: p.id, sku: p.sku, name: p.name,
+            sellingPrice: parseFloat(p.selling_price), costPrice: parseFloat(p.cost_price),
+            stock: p.stock, reorderLevel: p.reorder_level, active: p.active
+          }, requestOrigin);
         });
       });
       return;
@@ -485,7 +624,8 @@ const server = http.createServer(async (req, res) => {
       await checkAuth(req, res, 'customers', 'view', async () => {
         const result = await query('SELECT * FROM customers ORDER BY id');
         sendJson(res, 200, result.rows.map(c => ({
-          id: c.id, customerCode: c.customer_code, name: c.name, phone: c.phone, email: c.email, address: c.address,
+          id: c.id, customerCode: c.customer_code, name: c.name,
+          phone: c.phone, email: c.email, address: c.address,
           balance: parseFloat(c.balance), creditLimit: parseFloat(c.credit_limit),
           totalPurchases: parseFloat(c.total_purchases), active: c.active
         })), requestOrigin);
@@ -496,18 +636,33 @@ const server = http.createServer(async (req, res) => {
     if (path === '/api/v1/customers' && method === 'POST') {
       await checkAuth(req, res, 'customers', 'create', async () => {
         parseBody(req, res, requestOrigin, async (err, body) => {
-          const codeResult = await query("SELECT COUNT(*) FROM customers");
-          const count = parseInt(codeResult.rows[0].count) + 1;
-          const customerCode = `CUST-${String(count).padStart(3, '0')}`;
-          const result = await query(
-            `INSERT INTO customers (customer_code, name, phone, email, address, balance, credit_limit, active)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-            [customerCode, body.name, body.phone || null, body.email || null, body.address || null,
-             parseFloat(body.balance) || 0, parseFloat(body.creditLimit) || 0, body.active !== false]
-          );
-          const c = result.rows[0];
-          sendJson(res, 201, { id: c.id, customerCode: c.customer_code, name: c.name, phone: c.phone, email: c.email,
-            balance: parseFloat(c.balance), creditLimit: parseFloat(c.credit_limit), active: c.active }, requestOrigin);
+          try {
+            const c = await insertWithUniqueNumber({
+              table: 'customers',
+              column: 'customer_code',
+              prefix: 'CUST',
+              pad: 3,
+              year: null,
+              buildRow: async (customerCode) => {
+                const result = await query(
+                  `INSERT INTO customers (customer_code, name, phone, email, address, balance, credit_limit, active)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+                  [customerCode, body.name, body.phone || null, body.email || null,
+                   body.address || null, parseFloat(body.balance) || 0,
+                   parseFloat(body.creditLimit) || 0, body.active !== false]
+                );
+                return result.rows[0];
+              }
+            });
+            sendJson(res, 201, {
+              id: c.id, customerCode: c.customer_code, name: c.name,
+              phone: c.phone, email: c.email, balance: parseFloat(c.balance),
+              creditLimit: parseFloat(c.credit_limit), active: c.active
+            }, requestOrigin);
+          } catch (dbError) {
+            console.error('❌ Customer INSERT failed:', dbError.message, dbError.detail);
+            sendJson(res, 500, { message: 'Failed to create customer', detail: dbError.message, code: dbError.code, constraint: dbError.constraint }, requestOrigin);
+          }
         });
       });
       return;
@@ -517,18 +672,27 @@ const server = http.createServer(async (req, res) => {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'customers', 'edit', async () => {
         parseBody(req, res, requestOrigin, async (err, body) => {
-          const fields = []; const values = []; let idx = 1;
-          const map = { name: 'name', phone: 'phone', email: 'email', address: 'address', balance: 'balance', creditLimit: 'credit_limit', active: 'active' };
+          const fields = [];
+          const values = [];
+          let idx = 1;
+          const map = {
+            name: 'name', phone: 'phone', email: 'email', address: 'address',
+            balance: 'balance', creditLimit: 'credit_limit', active: 'active'
+          };
           for (const [key, col] of Object.entries(map)) {
             if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
           }
           if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' }, requestOrigin);
-          fields.push('updated_at = NOW()'); values.push(id);
+          fields.push('updated_at = NOW()');
+          values.push(id);
           const result = await query(`UPDATE customers SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
           if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
           const c = result.rows[0];
-          sendJson(res, 200, { id: c.id, customerCode: c.customer_code, name: c.name, phone: c.phone, email: c.email,
-            balance: parseFloat(c.balance), creditLimit: parseFloat(c.credit_limit), active: c.active }, requestOrigin);
+          sendJson(res, 200, {
+            id: c.id, customerCode: c.customer_code, name: c.name,
+            phone: c.phone, email: c.email, balance: parseFloat(c.balance),
+            creditLimit: parseFloat(c.credit_limit), active: c.active
+          }, requestOrigin);
         });
       });
       return;
@@ -539,21 +703,34 @@ const server = http.createServer(async (req, res) => {
       const id = parseInt(path.split('/')[4]);
       await checkAuth(req, res, 'customers', 'view', async () => {
         const custResult = await query('SELECT * FROM customers WHERE id = $1', [id]);
-        if (custResult.rows.length === 0) return sendJson(res, 404, { message: 'Customer not found' }, requestOrigin);
+        if (custResult.rows.length === 0) {
+          return sendJson(res, 404, { message: 'Customer not found' }, requestOrigin);
+        }
         const customer = custResult.rows[0];
-        const salesResult = await query(`SELECT * FROM sales WHERE customer_id = $1 AND balance_due > 0 ORDER BY sale_date DESC`, [id]);
+        const salesResult = await query(
+          `SELECT * FROM sales WHERE customer_id = $1 AND balance_due > 0 ORDER BY sale_date DESC`,
+          [id]
+        );
         const totalCredit = salesResult.rows.reduce((sum, s) => sum + parseFloat(s.balance_due), 0);
         const totalSales = salesResult.rows.reduce((sum, s) => sum + parseFloat(s.total), 0);
         const totalPaid = salesResult.rows.reduce((sum, s) => sum + parseFloat(s.amount_paid), 0);
         sendJson(res, 200, {
-          customer: { id: customer.id, name: customer.name, phone: customer.phone, email: customer.email,
-            balance: parseFloat(customer.balance), creditLimit: parseFloat(customer.credit_limit) },
-          summary: { totalSales, totalPaid, totalOutstanding: totalCredit,
+          customer: {
+            id: customer.id, name: customer.name, phone: customer.phone,
+            email: customer.email, balance: parseFloat(customer.balance),
+            creditLimit: parseFloat(customer.credit_limit),
+          },
+          summary: {
+            totalSales, totalPaid, totalOutstanding: totalCredit,
             availableCredit: parseFloat(customer.credit_limit) - parseFloat(customer.balance),
-            transactionsCount: salesResult.rows.length },
-          transactions: salesResult.rows.map(s => ({ id: s.id, invoiceNumber: s.invoice_number, saleDate: s.sale_date,
-            saleTime: s.sale_time, total: parseFloat(s.total), amountPaid: parseFloat(s.amount_paid),
-            balanceDue: parseFloat(s.balance_due), paymentStatus: s.payment_status, items: s.items || [] }))
+            transactionsCount: salesResult.rows.length,
+          },
+          transactions: salesResult.rows.map(s => ({
+            id: s.id, invoiceNumber: s.invoice_number, saleDate: s.sale_date,
+            saleTime: s.sale_time, total: parseFloat(s.total),
+            amountPaid: parseFloat(s.amount_paid), balanceDue: parseFloat(s.balance_due),
+            paymentStatus: s.payment_status, items: s.items || [],
+          }))
         }, requestOrigin);
       });
       return;
@@ -564,8 +741,9 @@ const server = http.createServer(async (req, res) => {
       await checkAuth(req, res, 'suppliers', 'view', async () => {
         const result = await query('SELECT * FROM suppliers ORDER BY id');
         sendJson(res, 200, result.rows.map(s => ({
-          id: s.id, supplierCode: s.supplier_code, name: s.name, contactPerson: s.contact_person,
-          phone: s.phone, email: s.email, address: s.address, city: s.city, country: s.country,
+          id: s.id, supplierCode: s.supplier_code, name: s.name,
+          contactPerson: s.contact_person, phone: s.phone, email: s.email,
+          address: s.address, city: s.city, country: s.country,
           taxId: s.tax_id, paymentTerms: s.payment_terms,
           creditLimit: parseFloat(s.credit_limit), balance: parseFloat(s.balance),
           notes: s.notes, active: s.active
@@ -578,20 +756,35 @@ const server = http.createServer(async (req, res) => {
       await checkAuth(req, res, 'suppliers', 'create', async () => {
         parseBody(req, res, requestOrigin, async (err, body) => {
           if (!body.name) return sendJson(res, 400, { message: 'Name required' }, requestOrigin);
-          const codeResult = await query("SELECT COUNT(*) FROM suppliers");
-          const count = parseInt(codeResult.rows[0].count) + 1;
-          const supplierCode = `SUP-${String(count).padStart(3, '0')}`;
-          const result = await query(
-            `INSERT INTO suppliers (supplier_code, name, contact_person, phone, email, address, city, country, tax_id, payment_terms, credit_limit, balance, notes, active)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
-            [supplierCode, body.name, body.contactPerson || null, body.phone || null, body.email || null,
-             body.address || null, body.city || null, body.country || 'Ethiopia', body.taxId || null,
-             body.paymentTerms || 'Cash', parseFloat(body.creditLimit) || 0, parseFloat(body.balance) || 0,
-             body.notes || null, body.active !== false]
-          );
-          const s = result.rows[0];
-          sendJson(res, 201, { id: s.id, supplierCode: s.supplier_code, name: s.name, contactPerson: s.contact_person,
-            phone: s.phone, email: s.email, balance: parseFloat(s.balance), active: s.active }, requestOrigin);
+          try {
+            const s = await insertWithUniqueNumber({
+              table: 'suppliers',
+              column: 'supplier_code',
+              prefix: 'SUP',
+              pad: 3,
+              year: null,
+              buildRow: async (supplierCode) => {
+                const result = await query(
+                  `INSERT INTO suppliers (supplier_code, name, contact_person, phone, email, address, city, country, tax_id, payment_terms, credit_limit, balance, notes, active)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING *`,
+                  [supplierCode, body.name, body.contactPerson || null, body.phone || null,
+                   body.email || null, body.address || null, body.city || null,
+                   body.country || 'Ethiopia', body.taxId || null, body.paymentTerms || 'Cash',
+                   parseFloat(body.creditLimit) || 0, parseFloat(body.balance) || 0,
+                   body.notes || null, body.active !== false]
+                );
+                return result.rows[0];
+              }
+            });
+            sendJson(res, 201, {
+              id: s.id, supplierCode: s.supplier_code, name: s.name,
+              contactPerson: s.contact_person, phone: s.phone, email: s.email,
+              balance: parseFloat(s.balance), active: s.active
+            }, requestOrigin);
+          } catch (dbError) {
+            console.error('❌ Supplier INSERT failed:', dbError.message, dbError.detail);
+            sendJson(res, 500, { message: 'Failed to create supplier', detail: dbError.message, code: dbError.code, constraint: dbError.constraint }, requestOrigin);
+          }
         });
       });
       return;
@@ -601,20 +794,29 @@ const server = http.createServer(async (req, res) => {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'suppliers', 'edit', async () => {
         parseBody(req, res, requestOrigin, async (err, body) => {
-          const fields = []; const values = []; let idx = 1;
-          const map = { name: 'name', contactPerson: 'contact_person', phone: 'phone', email: 'email', address: 'address',
-            city: 'city', country: 'country', taxId: 'tax_id', paymentTerms: 'payment_terms',
-            creditLimit: 'credit_limit', balance: 'balance', notes: 'notes', active: 'active' };
+          const fields = [];
+          const values = [];
+          let idx = 1;
+          const map = {
+            name: 'name', contactPerson: 'contact_person', phone: 'phone', email: 'email',
+            address: 'address', city: 'city', country: 'country', taxId: 'tax_id',
+            paymentTerms: 'payment_terms', creditLimit: 'credit_limit',
+            balance: 'balance', notes: 'notes', active: 'active'
+          };
           for (const [key, col] of Object.entries(map)) {
             if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
           }
           if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' }, requestOrigin);
-          fields.push('updated_at = NOW()'); values.push(id);
+          fields.push('updated_at = NOW()');
+          values.push(id);
           const result = await query(`UPDATE suppliers SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
           if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
           const s = result.rows[0];
-          sendJson(res, 200, { id: s.id, supplierCode: s.supplier_code, name: s.name, contactPerson: s.contact_person,
-            phone: s.phone, email: s.email, balance: parseFloat(s.balance), active: s.active }, requestOrigin);
+          sendJson(res, 200, {
+            id: s.id, supplierCode: s.supplier_code, name: s.name,
+            contactPerson: s.contact_person, phone: s.phone, email: s.email,
+            balance: parseFloat(s.balance), active: s.active
+          }, requestOrigin);
         });
       });
       return;
@@ -635,12 +837,16 @@ const server = http.createServer(async (req, res) => {
       await checkAuth(req, res, 'sales', 'view', async () => {
         const result = await query('SELECT * FROM sales ORDER BY id DESC');
         sendJson(res, 200, result.rows.map(s => ({
-          id: s.id, invoiceNumber: s.invoice_number, saleDate: s.sale_date, saleTime: s.sale_time,
-          customerId: s.customer_id, customerName: s.customer_name, cashierId: s.cashier_id, cashierName: s.cashier_name,
-          cashierUsername: s.cashier_username, createdByName: s.created_by_name, createdByUsername: s.created_by_username,
-          status: s.status, subtotal: parseFloat(s.subtotal), discount: parseFloat(s.discount), tax: parseFloat(s.tax),
-          total: parseFloat(s.total), amountPaid: parseFloat(s.amount_paid), balanceDue: parseFloat(s.balance_due),
-          paymentStatus: s.payment_status, notes: s.notes, items: s.items || [], payments: s.payments || [], createdAt: s.created_at
+          id: s.id, invoiceNumber: s.invoice_number, saleDate: s.sale_date,
+          saleTime: s.sale_time, customerId: s.customer_id, customerName: s.customer_name,
+          cashierId: s.cashier_id, cashierName: s.cashier_name,
+          cashierUsername: s.cashier_username, createdByName: s.created_by_name,
+          createdByUsername: s.created_by_username, status: s.status,
+          subtotal: parseFloat(s.subtotal), discount: parseFloat(s.discount),
+          tax: parseFloat(s.tax), total: parseFloat(s.total),
+          amountPaid: parseFloat(s.amount_paid), balanceDue: parseFloat(s.balance_due),
+          paymentStatus: s.payment_status, notes: s.notes,
+          items: s.items || [], payments: s.payments || [], createdAt: s.created_at
         })), requestOrigin);
       });
       return;
@@ -651,25 +857,39 @@ const server = http.createServer(async (req, res) => {
         parseBody(req, res, requestOrigin, async (err, body) => {
           const { items, customerId, paymentMethod, amountReceived, notes, discount } = body;
           if (!items || items.length === 0) return sendJson(res, 400, { message: 'No items' }, requestOrigin);
+
           const client = await pool.connect();
           try {
             await client.query('BEGIN');
-            let subtotal = 0; const saleItems = [];
+            let subtotal = 0;
+            const saleItems = [];
+
             for (const item of items) {
               const prodResult = await client.query('SELECT * FROM products WHERE id = $1 FOR UPDATE', [item.productId]);
               const product = prodResult.rows[0];
-              if (!product) { await client.query('ROLLBACK'); return sendJson(res, 404, { message: `Product ${item.productId} not found` }, requestOrigin); }
-              if (product.stock < item.quantity) { await client.query('ROLLBACK'); return sendJson(res, 400, { message: `Insufficient stock: ${product.name}` }, requestOrigin); }
+              if (!product) {
+                await client.query('ROLLBACK');
+                return sendJson(res, 404, { message: `Product ${item.productId} not found` }, requestOrigin);
+              }
+              if (product.stock < item.quantity) {
+                await client.query('ROLLBACK');
+                return sendJson(res, 400, { message: `Insufficient stock: ${product.name}` }, requestOrigin);
+              }
               const lineTotal = item.quantity * item.unitPrice - (item.discount || 0);
               subtotal += lineTotal;
-              saleItems.push({ productId: product.id, productNameSnapshot: product.name, quantity: item.quantity,
-                unitPrice: item.unitPrice, unitCost: parseFloat(product.cost_price),
-                discount: item.discount || 0, tax: item.tax || 0, lineTotal });
+              saleItems.push({
+                productId: product.id, productNameSnapshot: product.name,
+                quantity: item.quantity, unitPrice: item.unitPrice,
+                unitCost: parseFloat(product.cost_price),
+                discount: item.discount || 0, tax: item.tax || 0, lineTotal
+              });
               await client.query('UPDATE products SET stock = stock - $1 WHERE id = $2', [item.quantity, item.productId]);
             }
+
             const discountAmount = discount || 0;
             const total = subtotal - discountAmount;
             const balanceDue = total - (amountReceived || 0);
+
             let customerName = null;
             if (customerId) {
               const custResult = await client.query('SELECT * FROM customers WHERE id = $1', [customerId]);
@@ -682,39 +902,58 @@ const server = http.createServer(async (req, res) => {
                   const newBalance = currentBalance + balanceDue;
                   if (creditLimit > 0 && newBalance > creditLimit) {
                     await client.query('ROLLBACK');
-                    return sendJson(res, 400, { message: `Credit limit exceeded.`, currentBalance, creditLimit, attemptedBalance: newBalance, exceededBy: newBalance - creditLimit }, requestOrigin);
+                    return sendJson(res, 400, {
+                      message: `Credit limit exceeded. ${customer.name} has ETB ${currentBalance.toFixed(2)} outstanding with a limit of ETB ${creditLimit.toFixed(2)}. This sale would bring balance to ETB ${newBalance.toFixed(2)}.`,
+                      currentBalance, creditLimit, attemptedBalance: newBalance, exceededBy: newBalance - creditLimit
+                    }, requestOrigin);
                   }
                   await client.query('UPDATE customers SET balance = balance + $1 WHERE id = $2', [balanceDue, customerId]);
                 }
               }
             }
+
             const fullName = `${user.firstName} ${user.lastName}`;
             const invoiceNumber = `INV-${new Date().getFullYear()}-${String(Date.now()).slice(-6)}`;
+
             const saleResult = await client.query(
               `INSERT INTO sales (invoice_number, sale_date, sale_time, customer_id, customer_name,
                 cashier_id, cashier_name, cashier_username, created_by, created_by_name, created_by_username,
                 status, subtotal, discount, tax, total, amount_paid, balance_due, payment_status, notes, items, payments)
                VALUES ($1, NOW(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21) RETURNING *`,
-              [invoiceNumber, new Date().toLocaleTimeString(), customerId || null, customerName,
-               user.id, fullName, user.username, user.id, fullName, user.username,
-               balanceDue > 0 ? 'Credit' : 'Completed', subtotal, discountAmount, 0, total, amountReceived || 0,
-               balanceDue > 0 ? balanceDue : 0, balanceDue > 0 ? (amountReceived > 0 ? 'Partial' : 'Credit') : 'Paid',
-               notes || null, JSON.stringify(saleItems),
-               JSON.stringify(amountReceived > 0 ? [{ paymentMethod: paymentMethod || 'Cash', amount: amountReceived }] : [])]
+              [
+                invoiceNumber, new Date().toLocaleTimeString(),
+                customerId || null, customerName,
+                user.id, fullName, user.username,
+                user.id, fullName, user.username,
+                balanceDue > 0 ? 'Credit' : 'Completed',
+                subtotal, discountAmount, 0, total, amountReceived || 0,
+                balanceDue > 0 ? balanceDue : 0,
+                balanceDue > 0 ? (amountReceived > 0 ? 'Partial' : 'Credit') : 'Paid',
+                notes || null, JSON.stringify(saleItems),
+                JSON.stringify(amountReceived > 0 ? [{ paymentMethod: paymentMethod || 'Cash', amount: amountReceived }] : [])
+              ]
             );
+
             await client.query('COMMIT');
+
             const s = saleResult.rows[0];
-            const sale = { id: s.id, invoiceNumber: s.invoice_number, saleDate: s.sale_date, saleTime: s.sale_time,
-              customerId: s.customer_id, customerName: s.customer_name, cashierName: s.cashier_name, status: s.status,
-              subtotal: parseFloat(s.subtotal), discount: parseFloat(s.discount), total: parseFloat(s.total),
-              amountPaid: parseFloat(s.amount_paid), balanceDue: parseFloat(s.balance_due),
-              paymentStatus: s.payment_status, items: s.items || [] };
+            const sale = {
+              id: s.id, invoiceNumber: s.invoice_number, saleDate: s.sale_date, saleTime: s.sale_time,
+              customerId: s.customer_id, customerName: s.customer_name,
+              cashierName: s.cashier_name, status: s.status,
+              subtotal: parseFloat(s.subtotal), discount: parseFloat(s.discount),
+              total: parseFloat(s.total), amountPaid: parseFloat(s.amount_paid),
+              balanceDue: parseFloat(s.balance_due), paymentStatus: s.payment_status,
+              items: s.items || []
+            };
             sendJson(res, 201, { ...sale, receipt: generateReceipt(sale) }, requestOrigin);
           } catch (error) {
             await client.query('ROLLBACK');
             console.error('❌ Sale error:', error);
             sendJson(res, 500, { message: 'Failed to create sale', detail: error.message }, requestOrigin);
-          } finally { client.release(); }
+          } finally {
+            client.release();
+          }
         });
       });
       return;
@@ -723,13 +962,18 @@ const server = http.createServer(async (req, res) => {
     if (path.match(/^\/api\/v1\/sales\/\d+$/) && method === 'DELETE') {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'sales', 'delete', async (user) => {
-        if (!user.roles.includes('Super Admin')) return sendJson(res, 403, { message: 'Super Admin only' }, requestOrigin);
+        if (!user.roles.includes('Super Admin')) {
+          return sendJson(res, 403, { message: 'Super Admin only' }, requestOrigin);
+        }
         const client = await pool.connect();
         try {
           await client.query('BEGIN');
           const saleResult = await client.query('SELECT * FROM sales WHERE id = $1', [id]);
           const sale = saleResult.rows[0];
-          if (!sale) { await client.query('ROLLBACK'); return sendJson(res, 404, { message: 'Not found' }, requestOrigin); }
+          if (!sale) {
+            await client.query('ROLLBACK');
+            return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
+          }
           for (const item of (sale.items || [])) {
             await client.query('UPDATE products SET stock = stock + $1 WHERE id = $2', [item.quantity, item.productId]);
           }
@@ -742,7 +986,9 @@ const server = http.createServer(async (req, res) => {
         } catch (error) {
           await client.query('ROLLBACK');
           sendJson(res, 500, { message: 'Failed to delete', detail: error.message }, requestOrigin);
-        } finally { client.release(); }
+        } finally {
+          client.release();
+        }
       });
       return;
     }
@@ -752,14 +998,18 @@ const server = http.createServer(async (req, res) => {
       await checkAuth(req, res, 'services', 'view', async () => {
         const result = await query('SELECT * FROM services ORDER BY id DESC');
         sendJson(res, 200, result.rows.map(s => ({
-          id: s.id, jobNumber: s.job_number, customerId: s.customer_id, customerName: s.customer_name,
-          customerPhone: s.customer_phone, serviceTypeId: s.service_type_id, serviceType: s.service_type,
-          description: s.description, quantity: s.quantity, unitPrice: parseFloat(s.unit_price),
-          discount: parseFloat(s.discount), tax: parseFloat(s.tax), total: parseFloat(s.total),
+          id: s.id, jobNumber: s.job_number, customerId: s.customer_id,
+          customerName: s.customer_name, customerPhone: s.customer_phone,
+          serviceTypeId: s.service_type_id, serviceType: s.service_type,
+          description: s.description, quantity: s.quantity,
+          unitPrice: parseFloat(s.unit_price), discount: parseFloat(s.discount),
+          tax: parseFloat(s.tax), total: parseFloat(s.total),
           amountPaid: parseFloat(s.amount_paid), balance: parseFloat(s.balance),
-          receivedDate: s.received_date, expectedDate: s.expected_date, completedDate: s.completed_date,
-          priority: s.priority, status: s.status, notes: s.notes, createdBy: s.created_by,
-          createdByName: s.created_by_name, createdByUsername: s.created_by_username, createdAt: s.created_at
+          receivedDate: s.received_date, expectedDate: s.expected_date,
+          completedDate: s.completed_date, priority: s.priority, status: s.status,
+          notes: s.notes, createdBy: s.created_by,
+          createdByName: s.created_by_name, createdByUsername: s.created_by_username,
+          createdAt: s.created_at
         })), requestOrigin);
       });
       return;
@@ -769,33 +1019,105 @@ const server = http.createServer(async (req, res) => {
       await checkAuth(req, res, 'services', 'create', async (user) => {
         parseBody(req, res, requestOrigin, async (err, body) => {
           console.log('📥 Services POST body:', JSON.stringify(body));
-          const unitPrice = parseFloat(body.unitPrice) || 0;
-          const quantity = parseInt(body.quantity) || 1;
-          const discount = parseFloat(body.discount) || 0;
-          const tax = parseFloat(body.tax) || 0;
+
+          const safeInt = (v) => {
+            if (v === undefined || v === null || v === '') return null;
+            const n = parseInt(v, 10);
+            return Number.isFinite(n) ? n : null;
+          };
+          const safeNum = (v, d = 0) => {
+            if (v === undefined || v === null || v === '') return d;
+            const n = Number(v);
+            return Number.isFinite(n) ? n : d;
+          };
+          const safeDate = (v) => {
+            if (!v) return null;
+            const d = new Date(v);
+            if (isNaN(d.getTime())) throw new Error(`Invalid date: ${v}`);
+            return d.toISOString();
+          };
+
+          const unitPrice = safeNum(body.unitPrice, 0);
+          const quantity = safeInt(body.quantity) ?? 1;
+          const discount = safeNum(body.discount, 0);
+          const tax = safeNum(body.tax, 0);
+          const amountPaid = safeNum(body.amountPaid, 0);
           const total = (unitPrice * quantity) - discount + tax;
-          const amountPaid = parseFloat(body.amountPaid) || 0;
           const balance = total - amountPaid;
-          const countResult = await query('SELECT COUNT(*) FROM services');
-          const count = parseInt(countResult.rows[0].count) + 1;
-          const jobNumber = `SRV-${new Date().getFullYear()}-${String(count).padStart(4, '0')}`;
+          const customerId = safeInt(body.customerId);
+          const serviceTypeId = safeInt(body.serviceTypeId);
+
+          let receivedDate;
+          try {
+            receivedDate = safeDate(body.receivedDate) || new Date().toISOString();
+          } catch (e) {
+            return sendJson(res, 400, { message: 'Invalid receivedDate', detail: e.message }, requestOrigin);
+          }
+          let expectedDate = null;
+          try { expectedDate = safeDate(body.expectedDate); }
+          catch (e) { return sendJson(res, 400, { message: 'Invalid expectedDate', detail: e.message }, requestOrigin); }
+
           const fullName = `${user.firstName} ${user.lastName}`;
-          const result = await query(
-            `INSERT INTO services (job_number, customer_id, customer_name, customer_phone,
-              service_type_id, service_type, description, quantity, unit_price, discount, tax,
-              total, amount_paid, balance, received_date, expected_date, priority, status, notes,
-              created_by, created_by_name, created_by_username)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) RETURNING *`,
-            [jobNumber, body.customerId ? parseInt(body.customerId) : null, body.customerName || null, body.customerPhone || null,
-             body.serviceTypeId ? parseInt(body.serviceTypeId) : null, body.serviceType || '', body.description || '',
-             quantity, unitPrice, discount, tax, total, amountPaid, balance,
-             body.receivedDate ? new Date(body.receivedDate).toISOString() : new Date().toISOString(),
-             body.expectedDate || null, body.priority || 'Normal', body.status || 'Received', body.notes || null,
-             user.id, fullName, user.username]
-          );
-          const s = result.rows[0];
-          sendJson(res, 201, { id: s.id, jobNumber: s.job_number, serviceType: s.service_type,
-            total: parseFloat(s.total), status: s.status, receivedDate: s.received_date, createdAt: s.created_at }, requestOrigin);
+
+          try {
+            const inserted = await insertWithUniqueNumber({
+              table: 'services',
+              column: 'job_number',
+              prefix: 'SRV',
+              pad: 4,
+              buildRow: async (jobNumber) => {
+                const result = await query(
+                  `INSERT INTO services (
+                     job_number, customer_id, customer_name, customer_phone,
+                     service_type_id, service_type, description, quantity, unit_price, discount, tax,
+                     total, amount_paid, balance, received_date, expected_date, priority, status, notes,
+                     created_by, created_by_name, created_by_username
+                   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+                   RETURNING *`,
+                  [
+                    jobNumber,
+                    customerId,
+                    body.customerName || null,
+                    body.customerPhone || null,
+                    serviceTypeId,
+                    body.serviceType || '',
+                    body.description || '',
+                    quantity, unitPrice, discount, tax,
+                    total, amountPaid, balance,
+                    receivedDate,
+                    expectedDate,
+                    body.priority || 'Normal',
+                    body.status || 'Received',
+                    body.notes || null,
+                    user.id, fullName, user.username
+                  ]
+                );
+                return result.rows[0];
+              }
+            });
+
+            sendJson(res, 201, {
+              id: inserted.id, jobNumber: inserted.job_number,
+              serviceType: inserted.service_type, total: parseFloat(inserted.total),
+              status: inserted.status, receivedDate: inserted.received_date,
+              createdAt: inserted.created_at
+            }, requestOrigin);
+          } catch (dbError) {
+            console.error('❌ Services INSERT failed:', {
+              message: dbError.message, code: dbError.code,
+              detail: dbError.detail, constraint: dbError.constraint, column: dbError.column,
+              payload: { customerId, serviceTypeId, receivedDate, expectedDate, quantity, unitPrice, total }
+            });
+            let friendly = 'Failed to create service';
+            if (dbError.code === '23502') friendly = `Missing required field: ${dbError.column}`;
+            else if (dbError.code === '23503') friendly = `Related record not found (${dbError.constraint})`;
+            else if (dbError.code === '22P02') friendly = `Invalid value: ${dbError.message}`;
+            else if (dbError.code === '23505') friendly = `Duplicate value: ${dbError.detail || dbError.message}`;
+            sendJson(res, 500, {
+              message: friendly, detail: dbError.message,
+              code: dbError.code, column: dbError.column, constraint: dbError.constraint
+            }, requestOrigin);
+          }
         });
       });
       return;
@@ -805,22 +1127,30 @@ const server = http.createServer(async (req, res) => {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'services', 'edit', async () => {
         parseBody(req, res, requestOrigin, async (err, body) => {
-          const fields = []; const values = []; let idx = 1;
-          const map = { customerId: 'customer_id', customerName: 'customer_name', customerPhone: 'customer_phone',
+          const fields = [];
+          const values = [];
+          let idx = 1;
+          const map = {
+            customerId: 'customer_id', customerName: 'customer_name', customerPhone: 'customer_phone',
             serviceTypeId: 'service_type_id', serviceType: 'service_type', description: 'description',
             quantity: 'quantity', unitPrice: 'unit_price', discount: 'discount', tax: 'tax',
             total: 'total', amountPaid: 'amount_paid', balance: 'balance',
             receivedDate: 'received_date', expectedDate: 'expected_date', completedDate: 'completed_date',
-            priority: 'priority', status: 'status', notes: 'notes' };
+            priority: 'priority', status: 'status', notes: 'notes'
+          };
           for (const [key, col] of Object.entries(map)) {
             if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
           }
           if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' }, requestOrigin);
-          fields.push('updated_at = NOW()'); values.push(id);
+          fields.push('updated_at = NOW()');
+          values.push(id);
           const result = await query(`UPDATE services SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
           if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
           const s = result.rows[0];
-          sendJson(res, 200, { id: s.id, jobNumber: s.job_number, status: s.status, total: parseFloat(s.total), amountPaid: parseFloat(s.amount_paid) }, requestOrigin);
+          sendJson(res, 200, {
+            id: s.id, jobNumber: s.job_number, status: s.status,
+            total: parseFloat(s.total), amountPaid: parseFloat(s.amount_paid)
+          }, requestOrigin);
         });
       });
       return;
@@ -841,7 +1171,8 @@ const server = http.createServer(async (req, res) => {
       await checkAuth(req, res, 'services', 'view', async () => {
         const result = await query('SELECT * FROM service_types ORDER BY id');
         sendJson(res, 200, result.rows.map(t => ({
-          id: t.id, name: t.name, description: t.description, defaultPrice: parseFloat(t.default_price), active: t.active
+          id: t.id, name: t.name, description: t.description,
+          defaultPrice: parseFloat(t.default_price), active: t.active
         })), requestOrigin);
       });
       return;
@@ -856,7 +1187,10 @@ const server = http.createServer(async (req, res) => {
             [body.name, body.description || '', parseFloat(body.defaultPrice) || 0, body.active !== false]
           );
           const t = result.rows[0];
-          sendJson(res, 201, { id: t.id, name: t.name, description: t.description, defaultPrice: parseFloat(t.default_price), active: t.active }, requestOrigin);
+          sendJson(res, 201, {
+            id: t.id, name: t.name, description: t.description,
+            defaultPrice: parseFloat(t.default_price), active: t.active
+          }, requestOrigin);
         });
       });
       return;
@@ -866,7 +1200,9 @@ const server = http.createServer(async (req, res) => {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'services', 'edit', async () => {
         parseBody(req, res, requestOrigin, async (err, body) => {
-          const fields = []; const values = []; let idx = 1;
+          const fields = [];
+          const values = [];
+          let idx = 1;
           if (body.name !== undefined) { fields.push(`name = $${idx++}`); values.push(body.name); }
           if (body.description !== undefined) { fields.push(`description = $${idx++}`); values.push(body.description); }
           if (body.defaultPrice !== undefined) { fields.push(`default_price = $${idx++}`); values.push(body.defaultPrice); }
@@ -876,7 +1212,10 @@ const server = http.createServer(async (req, res) => {
           const result = await query(`UPDATE service_types SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
           if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
           const t = result.rows[0];
-          sendJson(res, 200, { id: t.id, name: t.name, description: t.description, defaultPrice: parseFloat(t.default_price), active: t.active }, requestOrigin);
+          sendJson(res, 200, {
+            id: t.id, name: t.name, description: t.description,
+            defaultPrice: parseFloat(t.default_price), active: t.active
+          }, requestOrigin);
         });
       });
       return;
@@ -897,11 +1236,14 @@ const server = http.createServer(async (req, res) => {
       await checkAuth(req, res, 'expenses', 'view', async () => {
         const result = await query('SELECT * FROM expenses ORDER BY id DESC');
         sendJson(res, 200, result.rows.map(e => ({
-          id: e.id, expenseNumber: e.expense_number, description: e.description, category: e.category,
-          amount: parseFloat(e.amount), tax: parseFloat(e.tax), total: parseFloat(e.total),
-          expenseDate: e.expense_date, paymentMethod: e.payment_method, status: e.status, notes: e.notes,
-          createdBy: e.created_by, createdByName: e.created_by_name, createdByUsername: e.created_by_username,
-          approvedBy: e.approved_by, approvedByName: e.approved_by_name, approvedAt: e.approved_at, createdAt: e.created_at
+          id: e.id, expenseNumber: e.expense_number, description: e.description,
+          category: e.category, amount: parseFloat(e.amount), tax: parseFloat(e.tax),
+          total: parseFloat(e.total), expenseDate: e.expense_date,
+          paymentMethod: e.payment_method, status: e.status, notes: e.notes,
+          createdBy: e.created_by, createdByName: e.created_by_name,
+          createdByUsername: e.created_by_username,
+          approvedBy: e.approved_by, approvedByName: e.approved_by_name,
+          approvedAt: e.approved_at, createdAt: e.created_at
         })), requestOrigin);
       });
       return;
@@ -910,24 +1252,37 @@ const server = http.createServer(async (req, res) => {
     if (path === '/api/v1/expenses' && method === 'POST') {
       await checkAuth(req, res, 'expenses', 'create', async (user) => {
         parseBody(req, res, requestOrigin, async (err, body) => {
-          const countResult = await query('SELECT COUNT(*) FROM expenses');
-          const count = parseInt(countResult.rows[0].count) + 1;
-          const expenseNumber = `EXP-${new Date().getFullYear()}-${String(count).padStart(4, '0')}`;
           const amount = parseFloat(body.amount) || 0;
           const tax = parseFloat(body.tax) || 0;
           const total = amount + tax;
           const fullName = `${user.firstName} ${user.lastName}`;
-          const result = await query(
-            `INSERT INTO expenses (expense_number, description, category, amount, tax, total,
-              expense_date, payment_method, status, notes, created_by, created_by_name, created_by_username)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-            [expenseNumber, body.description, body.category || 'Other', amount, tax, total,
-             body.expenseDate || new Date().toISOString().split('T')[0], body.paymentMethod || 'Cash',
-             'Pending', body.notes || null, user.id, fullName, user.username]
-          );
-          const e = result.rows[0];
-          sendJson(res, 201, { id: e.id, expenseNumber: e.expense_number, description: e.description,
-            amount: parseFloat(e.amount), total: parseFloat(e.total), status: e.status }, requestOrigin);
+          try {
+            const e = await insertWithUniqueNumber({
+              table: 'expenses',
+              column: 'expense_number',
+              prefix: 'EXP',
+              pad: 4,
+              buildRow: async (expenseNumber) => {
+                const result = await query(
+                  `INSERT INTO expenses (expense_number, description, category, amount, tax, total,
+                    expense_date, payment_method, status, notes, created_by, created_by_name, created_by_username)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+                  [expenseNumber, body.description, body.category || 'Other',
+                   amount, tax, total, body.expenseDate || new Date().toISOString().split('T')[0],
+                   body.paymentMethod || 'Cash', 'Pending', body.notes || null,
+                   user.id, fullName, user.username]
+                );
+                return result.rows[0];
+              }
+            });
+            sendJson(res, 201, {
+              id: e.id, expenseNumber: e.expense_number, description: e.description,
+              amount: parseFloat(e.amount), total: parseFloat(e.total), status: e.status
+            }, requestOrigin);
+          } catch (dbError) {
+            console.error('❌ Expense INSERT failed:', dbError.message, dbError.detail);
+            sendJson(res, 500, { message: 'Failed to create expense', detail: dbError.message, code: dbError.code, constraint: dbError.constraint }, requestOrigin);
+          }
         });
       });
       return;
@@ -946,7 +1301,10 @@ const server = http.createServer(async (req, res) => {
           );
           if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
           const e = result.rows[0];
-          sendJson(res, 200, { id: e.id, expenseNumber: e.expense_number, status: e.status, approvedByName: e.approved_by_name, approvedAt: e.approved_at }, requestOrigin);
+          sendJson(res, 200, {
+            id: e.id, expenseNumber: e.expense_number, status: e.status,
+            approvedByName: e.approved_by_name, approvedAt: e.approved_at
+          }, requestOrigin);
         });
       });
       return;
@@ -956,18 +1314,27 @@ const server = http.createServer(async (req, res) => {
       const id = parseInt(path.split('/').pop());
       await checkAuth(req, res, 'expenses', 'approve', async () => {
         parseBody(req, res, requestOrigin, async (err, body) => {
-          const fields = []; const values = []; let idx = 1;
-          const map = { description: 'description', category: 'category', amount: 'amount', tax: 'tax', total: 'total',
-            expenseDate: 'expense_date', paymentMethod: 'payment_method', status: 'status', notes: 'notes' };
+          const fields = [];
+          const values = [];
+          let idx = 1;
+          const map = {
+            description: 'description', category: 'category', amount: 'amount',
+            tax: 'tax', total: 'total', expenseDate: 'expense_date',
+            paymentMethod: 'payment_method', status: 'status', notes: 'notes'
+          };
           for (const [key, col] of Object.entries(map)) {
             if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
           }
           if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' }, requestOrigin);
-          fields.push('updated_at = NOW()'); values.push(id);
+          fields.push('updated_at = NOW()');
+          values.push(id);
           const result = await query(`UPDATE expenses SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
           if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
           const e = result.rows[0];
-          sendJson(res, 200, { id: e.id, expenseNumber: e.expense_number, description: e.description, amount: parseFloat(e.amount), status: e.status }, requestOrigin);
+          sendJson(res, 200, {
+            id: e.id, expenseNumber: e.expense_number, description: e.description,
+            amount: parseFloat(e.amount), status: e.status
+          }, requestOrigin);
         });
       });
       return;
@@ -986,23 +1353,38 @@ const server = http.createServer(async (req, res) => {
     // ============ DASHBOARD ============
     if (path === '/api/v1/reports/dashboard' && method === 'GET') {
       await checkAuth(req, res, 'dashboard', 'view', async () => {
-        const todayResult = await query(`SELECT COALESCE(SUM(total), 0) as total_sales, COUNT(*) as count FROM sales WHERE sale_date >= CURRENT_DATE AND sale_date < CURRENT_DATE + INTERVAL '1 day'`);
+        const todayResult = await query(`
+          SELECT COALESCE(SUM(total), 0) as total_sales, COUNT(*) as count
+          FROM sales WHERE sale_date >= CURRENT_DATE AND sale_date < CURRENT_DATE + INTERVAL '1 day'
+        `);
         const todaySales = parseFloat(todayResult.rows[0].total_sales);
         const todaySalesCount = parseInt(todayResult.rows[0].count);
 
-        const todayServicesResult = await query(`SELECT COALESCE(SUM(total), 0) as total_revenue, COUNT(*) as count FROM services WHERE received_date >= CURRENT_DATE AND received_date < CURRENT_DATE + INTERVAL '1 day'`);
+        const todayServicesResult = await query(`
+          SELECT COALESCE(SUM(total), 0) as total_revenue, COUNT(*) as count
+          FROM services WHERE received_date >= CURRENT_DATE AND received_date < CURRENT_DATE + INTERVAL '1 day'
+        `);
         const todayServiceRevenue = parseFloat(todayServicesResult.rows[0].total_revenue);
         const todayServicesCount = parseInt(todayServicesResult.rows[0].count);
 
-        const monthResult = await query(`SELECT COALESCE(SUM(total), 0) as total_sales, COUNT(*) as count FROM sales WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE)`);
+        const monthResult = await query(`
+          SELECT COALESCE(SUM(total), 0) as total_sales, COUNT(*) as count
+          FROM sales WHERE sale_date >= DATE_TRUNC('month', CURRENT_DATE)
+        `);
         const monthSales = parseFloat(monthResult.rows[0].total_sales);
         const monthSalesCount = parseInt(monthResult.rows[0].count);
 
-        const monthServicesResult = await query(`SELECT COALESCE(SUM(total), 0) as total_revenue, COUNT(*) as count FROM services WHERE received_date >= DATE_TRUNC('month', CURRENT_DATE)`);
+        const monthServicesResult = await query(`
+          SELECT COALESCE(SUM(total), 0) as total_revenue, COUNT(*) as count
+          FROM services WHERE received_date >= DATE_TRUNC('month', CURRENT_DATE)
+        `);
         const monthServiceRevenue = parseFloat(monthServicesResult.rows[0].total_revenue);
         const monthServicesCount = parseInt(monthServicesResult.rows[0].count);
 
-        const expensesResult = await query(`SELECT COALESCE(SUM(total), 0) as total FROM expenses WHERE expense_date >= CURRENT_DATE AND expense_date < CURRENT_DATE + INTERVAL '1 day'`);
+        const expensesResult = await query(`
+          SELECT COALESCE(SUM(total), 0) as total
+          FROM expenses WHERE expense_date >= CURRENT_DATE AND expense_date < CURRENT_DATE + INTERVAL '1 day'
+        `);
         const todayExpenses = parseFloat(expensesResult.rows[0].total);
 
         const receivablesResult = await query('SELECT COALESCE(SUM(balance), 0) as total FROM customers');
@@ -1013,18 +1395,34 @@ const server = http.createServer(async (req, res) => {
         const inventoryValue = parseFloat(inventoryResult.rows[0].total);
         const lowStockResult = await query('SELECT COUNT(*) FROM products WHERE stock <= reorder_level');
         const lowStock = parseInt(lowStockResult.rows[0].count);
-        const pendingServicesResult = await query(`SELECT COUNT(*) FROM services WHERE status IN ('Received', 'In Progress', 'Waiting for Customer')`);
+        const pendingServicesResult = await query(
+          `SELECT COUNT(*) FROM services WHERE status IN ('Received', 'In Progress', 'Waiting for Customer')`
+        );
         const pendingServices = parseInt(pendingServicesResult.rows[0].count);
 
+        const totalTodaySales = todaySales + todayServiceRevenue;
+        const totalTodayTransactions = todaySalesCount + todayServicesCount;
+        const totalMonthSales = monthSales + monthServiceRevenue;
+        const totalMonthTransactions = monthSalesCount + monthServicesCount;
+
         sendJson(res, 200, {
-          todaySales: todaySales + todayServiceRevenue, todayProductSales: todaySales, todayServiceRevenue,
-          todayProfit: (todaySales * 0.3) + (todayServiceRevenue * 0.4), todayExpenses,
-          todaySalesCount: todaySalesCount + todayServicesCount,
-          monthSales: monthSales + monthServiceRevenue, monthProductSales: monthSales, monthServiceRevenue,
-          monthSalesCount: monthSalesCount + monthServicesCount,
+          todaySales: totalTodaySales,
+          todayProductSales: todaySales,
+          todayServiceRevenue: todayServiceRevenue,
+          todayProfit: (todaySales * 0.3) + (todayServiceRevenue * 0.4),
+          todayExpenses: todayExpenses,
+          todaySalesCount: totalTodayTransactions,
+          monthSales: totalMonthSales,
+          monthProductSales: monthSales,
+          monthServiceRevenue: monthServiceRevenue,
+          monthSalesCount: totalMonthTransactions,
           monthProfit: (monthSales * 0.3) + (monthServiceRevenue * 0.4),
-          cashBalance: 45000, receivables: receivables + serviceOutstanding, payables: 3200,
-          inventoryValue, lowStock, pendingServices,
+          cashBalance: 45000,
+          receivables: receivables + serviceOutstanding,
+          payables: 3200,
+          inventoryValue: inventoryValue,
+          lowStock: lowStock,
+          pendingServices: pendingServices,
         }, requestOrigin);
       });
       return;
@@ -1033,16 +1431,21 @@ const server = http.createServer(async (req, res) => {
     // ============ ADMIN REPORTS ============
     if (path === '/api/v1/reports/sales-by-cashier' && method === 'GET') {
       await checkAuth(req, res, 'reports', 'view', async (user) => {
-        if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) return sendJson(res, 403, { message: 'Insufficient permissions' }, requestOrigin);
+        if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) {
+          return sendJson(res, 403, { message: 'Insufficient permissions' }, requestOrigin);
+        }
         const { startDate, endDate } = parsedUrl.query;
-        let sql = 'SELECT * FROM sales WHERE 1=1'; const params = [];
+        let sql = 'SELECT * FROM sales WHERE 1=1';
+        const params = [];
         if (startDate) { params.push(startDate); sql += ` AND sale_date >= $${params.length}`; }
         if (endDate) { params.push(endDate); sql += ` AND sale_date <= $${params.length}`; }
         const result = await query(sql, params);
         const cashierData = {};
         result.rows.forEach(sale => {
           const name = sale.created_by_name || sale.cashier_name || 'Unknown';
-          if (!cashierData[name]) cashierData[name] = { cashier: name, totalSales: 0, count: 0, username: sale.created_by_username || 'unknown' };
+          if (!cashierData[name]) {
+            cashierData[name] = { cashier: name, totalSales: 0, count: 0, username: sale.created_by_username || 'unknown' };
+          }
           cashierData[name].totalSales += parseFloat(sale.total);
           cashierData[name].count += 1;
         });
@@ -1053,20 +1456,26 @@ const server = http.createServer(async (req, res) => {
 
     if (path === '/api/v1/reports/daily-services' && method === 'GET') {
       await checkAuth(req, res, 'reports', 'view', async (user) => {
-        if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) return sendJson(res, 403, { message: 'Insufficient permissions' }, requestOrigin);
+        if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) {
+          return sendJson(res, 403, { message: 'Insufficient permissions' }, requestOrigin);
+        }
         const { startDate, endDate } = parsedUrl.query;
-        let sql = 'SELECT * FROM services WHERE 1=1'; const params = [];
+        let sql = 'SELECT * FROM services WHERE 1=1';
+        const params = [];
         if (startDate) { params.push(startDate); sql += ` AND received_date >= $${params.length}`; }
         if (endDate) { params.push(endDate); sql += ` AND received_date <= $${params.length}`; }
         const result = await query(sql, params);
         sendJson(res, 200, result.rows.map(s => ({
           id: s.id, jobNumber: s.job_number, customerName: s.customer_name || 'Walk-in',
-          customerPhone: s.customer_phone, serviceType: s.service_type, description: s.description,
-          quantity: s.quantity, unitPrice: parseFloat(s.unit_price), discount: parseFloat(s.discount),
-          tax: parseFloat(s.tax), total: parseFloat(s.total), amountPaid: parseFloat(s.amount_paid),
-          balance: parseFloat(s.balance), status: s.status, priority: s.priority,
-          receivedDate: s.received_date, expectedDate: s.expected_date, completedDate: s.completed_date,
-          notes: s.notes, createdBy: s.created_by_name || s.created_by_username || 'Unknown',
+          customerPhone: s.customer_phone, serviceType: s.service_type,
+          description: s.description, quantity: s.quantity,
+          unitPrice: parseFloat(s.unit_price), discount: parseFloat(s.discount),
+          tax: parseFloat(s.tax), total: parseFloat(s.total),
+          amountPaid: parseFloat(s.amount_paid), balance: parseFloat(s.balance),
+          status: s.status, priority: s.priority,
+          receivedDate: s.received_date, expectedDate: s.expected_date,
+          completedDate: s.completed_date, notes: s.notes,
+          createdBy: s.created_by_name || s.created_by_username || 'Unknown',
           createdByUsername: s.created_by_username, createdAt: s.created_at
         })), requestOrigin);
       });
@@ -1075,16 +1484,21 @@ const server = http.createServer(async (req, res) => {
 
     if (path === '/api/v1/reports/services-by-user' && method === 'GET') {
       await checkAuth(req, res, 'reports', 'view', async (user) => {
-        if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) return sendJson(res, 403, { message: 'Insufficient permissions' }, requestOrigin);
+        if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) {
+          return sendJson(res, 403, { message: 'Insufficient permissions' }, requestOrigin);
+        }
         const { startDate, endDate } = parsedUrl.query;
-        let sql = 'SELECT * FROM services WHERE 1=1'; const params = [];
+        let sql = 'SELECT * FROM services WHERE 1=1';
+        const params = [];
         if (startDate) { params.push(startDate); sql += ` AND received_date >= $${params.length}`; }
         if (endDate) { params.push(endDate); sql += ` AND received_date <= $${params.length}`; }
         const result = await query(sql, params);
         const userData = {};
         result.rows.forEach(service => {
           const name = service.created_by_name || service.created_by_username || 'Unknown';
-          if (!userData[name]) userData[name] = { user: name, username: service.created_by_username || 'unknown', totalServices: 0, count: 0, completed: 0, pending: 0 };
+          if (!userData[name]) {
+            userData[name] = { user: name, username: service.created_by_username || 'unknown', totalServices: 0, count: 0, completed: 0, pending: 0 };
+          }
           userData[name].totalServices += parseFloat(service.total);
           userData[name].count += 1;
           if (service.status === 'Completed' || service.status === 'Delivered') userData[name].completed += 1;
@@ -1097,18 +1511,28 @@ const server = http.createServer(async (req, res) => {
 
     if (path === '/api/v1/reports/user-activity' && method === 'GET') {
       await checkAuth(req, res, 'reports', 'view', async (user) => {
-        if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) return sendJson(res, 403, { message: 'Insufficient permissions' }, requestOrigin);
+        if (!user.roles.includes('Super Admin') && !user.roles.includes('Manager')) {
+          return sendJson(res, 403, { message: 'Insufficient permissions' }, requestOrigin);
+        }
         const usersResult = await query('SELECT * FROM users');
         const salesResult = await query('SELECT * FROM sales');
         const servicesResult = await query('SELECT * FROM services');
         const expensesResult = await query('SELECT * FROM expenses');
         const activity = usersResult.rows.map(u => {
           const fullName = `${u.first_name} ${u.last_name}`;
-          const userSales = salesResult.rows.filter(s => s.created_by_username === u.username || s.cashier_username === u.username || s.created_by_name === fullName || s.cashier_name === fullName);
-          const userServices = servicesResult.rows.filter(s => s.created_by_username === u.username || s.created_by_name === fullName);
-          const userExpenses = expensesResult.rows.filter(e => e.created_by_username === u.username || e.created_by_name === fullName);
+          const userSales = salesResult.rows.filter(s =>
+            s.created_by_username === u.username || s.cashier_username === u.username ||
+            s.created_by_name === fullName || s.cashier_name === fullName
+          );
+          const userServices = servicesResult.rows.filter(s =>
+            s.created_by_username === u.username || s.created_by_name === fullName
+          );
+          const userExpenses = expensesResult.rows.filter(e =>
+            e.created_by_username === u.username || e.created_by_name === fullName
+          );
           return {
-            userId: u.id, username: u.username, fullName, roles: u.roles || [], active: u.active,
+            userId: u.id, username: u.username, fullName,
+            roles: u.roles || [], active: u.active,
             sales: { count: userSales.length, total: userSales.reduce((sum, s) => sum + parseFloat(s.total), 0) },
             services: { count: userServices.length, total: userServices.reduce((sum, s) => sum + parseFloat(s.total), 0) },
             expenses: { count: userExpenses.length, total: userExpenses.reduce((sum, e) => sum + parseFloat(e.total), 0) },
@@ -1120,6 +1544,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // ============ 404 ============
     console.log(`❌ Route not found: ${method} ${path}`);
     sendJson(res, 404, { message: 'Route not found' }, requestOrigin);
 
@@ -1153,7 +1578,6 @@ process.on('SIGINT', async () => {
   process.exit();
 });
 
-// Catch any last-resort unhandled rejections so the process doesn't die silently
 process.on('unhandledRejection', (err) => {
   console.error('❌ Unhandled promise rejection:', err);
 });
