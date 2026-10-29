@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const { Pool } = require('pg');
 
 const PORT = process.env.PORT || 3001;
-const BUILD_VERSION = '2024-06-cors-fix-v3';
+const BUILD_VERSION = '2024-06-cors-fix-v4';
 
 // ============ DATABASE CONNECTION ============
 const pool = new Pool({
@@ -73,9 +73,7 @@ async function insertWithUniqueNumber({ table, column, prefix, pad = 4, year = n
         err.code === '23505' &&
         (err.constraint?.includes(column) || err.detail?.includes(column));
       if (isNumberCollision && attempt < 19) {
-        // Re-read the max in case another request got there first
         next = (await fetchMax()) + 1;
-        // Ensure we always move forward even if re-read didn't change
         if (makeNum(next) === num) next = next + 1;
         console.warn(`⚠️  ${column} collision on ${num}, retrying with ${makeNum(next)}...`);
         continue;
@@ -152,7 +150,6 @@ function sendJson(res, status, data, origin) {
   res.end(JSON.stringify(data));
 }
 
-// ✅ parseBody now catches handler errors and always sends a response
 function parseBody(req, res, requestOrigin, callback) {
   let body = '';
   req.on('data', chunk => body += chunk);
@@ -833,9 +830,19 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ============ SALES ============
+    // ✅ FIXED: reads startDate / endDate from query, uses exclusive end (<)
     if (path === '/api/v1/sales' && method === 'GET') {
       await checkAuth(req, res, 'sales', 'view', async () => {
-        const result = await query('SELECT * FROM sales ORDER BY id DESC');
+        const { startDate, endDate } = parsedUrl.query;
+        let sql = 'SELECT * FROM sales WHERE 1=1';
+        const params = [];
+
+        if (startDate) { params.push(startDate); sql += ` AND sale_date >= $${params.length}`; }
+        if (endDate)   { params.push(endDate);   sql += ` AND sale_date <  $${params.length}`; } // exclusive
+
+        sql += ' ORDER BY id DESC';
+
+        const result = await query(sql, params);
         sendJson(res, 200, result.rows.map(s => ({
           id: s.id, invoiceNumber: s.invoice_number, saleDate: s.sale_date,
           saleTime: s.sale_time, customerId: s.customer_id, customerName: s.customer_name,
@@ -994,9 +1001,19 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ============ SERVICES ============
+    // ✅ FIXED: reads startDate / endDate from query, uses exclusive end (<)
     if (path === '/api/v1/services' && method === 'GET') {
       await checkAuth(req, res, 'services', 'view', async () => {
-        const result = await query('SELECT * FROM services ORDER BY id DESC');
+        const { startDate, endDate } = parsedUrl.query;
+        let sql = 'SELECT * FROM services WHERE 1=1';
+        const params = [];
+
+        if (startDate) { params.push(startDate); sql += ` AND received_date >= $${params.length}`; }
+        if (endDate)   { params.push(endDate);   sql += ` AND received_date <  $${params.length}`; } // exclusive
+
+        sql += ' ORDER BY id DESC';
+
+        const result = await query(sql, params);
         sendJson(res, 200, result.rows.map(s => ({
           id: s.id, jobNumber: s.job_number, customerId: s.customer_id,
           customerName: s.customer_name, customerPhone: s.customer_phone,
