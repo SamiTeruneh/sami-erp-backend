@@ -4,9 +4,10 @@ const http = require('http');
 const url = require('url');
 const crypto = require('crypto');
 const { Pool } = require('pg');
+const { createCustomerCredit } = require('./customerCredit');
 
 const PORT = process.env.PORT || 3001;
-const BUILD_VERSION = '2024-06-cors-fix-v4';
+const BUILD_VERSION = '2024-06-credit-v5';
 
 // ============ DATABASE CONNECTION ============
 const pool = new Pool({
@@ -263,6 +264,9 @@ function generateReceipt(sale) {
   return lines.join('\n');
 }
 
+// ============ CUSTOMER CREDIT (ledger, payments) ============
+const credit = createCustomerCredit({ query, pool, checkAuth, sendJson, parseBody, insertWithUniqueNumber });
+
 // ============ SERVER ============
 const server = http.createServer(async (req, res) => {
   const parsedUrl = url.parse(req.url, true);
@@ -280,6 +284,9 @@ const server = http.createServer(async (req, res) => {
       res.end();
       return;
     }
+
+    // ============ CUSTOMER CREDIT (list, create, edit, credit, payments, ledger) ============
+    if (await credit.handle(req, res, path, method, parsedUrl, requestOrigin)) return;
 
     // ============ HEALTH + VERSION ============
     if (path === '/api/v1/health' && method === 'GET') {
@@ -617,83 +624,8 @@ const server = http.createServer(async (req, res) => {
     }
 
     // ============ CUSTOMERS ============
-    if (path === '/api/v1/customers' && method === 'GET') {
-      await checkAuth(req, res, 'customers', 'view', async () => {
-        const result = await query('SELECT * FROM customers ORDER BY id');
-        sendJson(res, 200, result.rows.map(c => ({
-          id: c.id, customerCode: c.customer_code, name: c.name,
-          phone: c.phone, email: c.email, address: c.address,
-          balance: parseFloat(c.balance), creditLimit: parseFloat(c.credit_limit),
-          totalPurchases: parseFloat(c.total_purchases), active: c.active
-        })), requestOrigin);
-      });
-      return;
-    }
-
-    if (path === '/api/v1/customers' && method === 'POST') {
-      await checkAuth(req, res, 'customers', 'create', async () => {
-        parseBody(req, res, requestOrigin, async (err, body) => {
-          try {
-            const c = await insertWithUniqueNumber({
-              table: 'customers',
-              column: 'customer_code',
-              prefix: 'CUST',
-              pad: 3,
-              year: null,
-              buildRow: async (customerCode) => {
-                const result = await query(
-                  `INSERT INTO customers (customer_code, name, phone, email, address, balance, credit_limit, active)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-                  [customerCode, body.name, body.phone || null, body.email || null,
-                   body.address || null, parseFloat(body.balance) || 0,
-                   parseFloat(body.creditLimit) || 0, body.active !== false]
-                );
-                return result.rows[0];
-              }
-            });
-            sendJson(res, 201, {
-              id: c.id, customerCode: c.customer_code, name: c.name,
-              phone: c.phone, email: c.email, balance: parseFloat(c.balance),
-              creditLimit: parseFloat(c.credit_limit), active: c.active
-            }, requestOrigin);
-          } catch (dbError) {
-            console.error('❌ Customer INSERT failed:', dbError.message, dbError.detail);
-            sendJson(res, 500, { message: 'Failed to create customer', detail: dbError.message, code: dbError.code, constraint: dbError.constraint }, requestOrigin);
-          }
-        });
-      });
-      return;
-    }
-
-    if (path.match(/^\/api\/v1\/customers\/\d+$/) && method === 'PATCH') {
-      const id = parseInt(path.split('/').pop());
-      await checkAuth(req, res, 'customers', 'edit', async () => {
-        parseBody(req, res, requestOrigin, async (err, body) => {
-          const fields = [];
-          const values = [];
-          let idx = 1;
-          const map = {
-            name: 'name', phone: 'phone', email: 'email', address: 'address',
-            balance: 'balance', creditLimit: 'credit_limit', active: 'active'
-          };
-          for (const [key, col] of Object.entries(map)) {
-            if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
-          }
-          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' }, requestOrigin);
-          fields.push('updated_at = NOW()');
-          values.push(id);
-          const result = await query(`UPDATE customers SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
-          if (result.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, requestOrigin);
-          const c = result.rows[0];
-          sendJson(res, 200, {
-            id: c.id, customerCode: c.customer_code, name: c.name,
-            phone: c.phone, email: c.email, balance: parseFloat(c.balance),
-            creditLimit: parseFloat(c.credit_limit), active: c.active
-          }, requestOrigin);
-        });
-      });
-      return;
-    }
+    // GET / POST / PATCH /customers, plus /credit, /payments and /ledger,
+    // are handled by customerCredit.js (see the credit.handle(...) call near the top).
 
     // ============ CUSTOMER STATEMENT ============
     if (path.match(/^\/api\/v1\/customers\/\d+\/statement$/) && method === 'GET') {
@@ -894,12 +826,18 @@ const server = http.createServer(async (req, res) => {
             }
 
             const discountAmount = discount || 0;
-            const total = subtotal - discountAmount;
-            const balanceDue = total - (amountReceived || 0);
+            const total = Math.round((subtotal - discountAmount) * 100) / 100;
+            let balanceDue = Math.round((total - (amountReceived || 0)) * 100) / 100;
+            if (balanceDue < 0.01) balanceDue = 0;
+            if (balanceDue > 0 && !customerId) {
+              await client.query('ROLLBACK');
+              return sendJson(res, 400, { message: 'Select a registered customer to sell on credit' }, requestOrigin);
+            }
+            let creditPosted = null;
 
             let customerName = null;
             if (customerId) {
-              const custResult = await client.query('SELECT * FROM customers WHERE id = $1', [customerId]);
+              const custResult = await client.query('SELECT * FROM customers WHERE id = $1 FOR UPDATE', [customerId]);
               if (custResult.rows[0]) {
                 const customer = custResult.rows[0];
                 customerName = customer.name;
@@ -915,6 +853,7 @@ const server = http.createServer(async (req, res) => {
                     }, requestOrigin);
                   }
                   await client.query('UPDATE customers SET balance = balance + $1 WHERE id = $2', [balanceDue, customerId]);
+                  creditPosted = { amount: balanceDue, balanceAfter: newBalance };
                 }
               }
             }
@@ -940,6 +879,15 @@ const server = http.createServer(async (req, res) => {
                 JSON.stringify(amountReceived > 0 ? [{ paymentMethod: paymentMethod || 'Cash', amount: amountReceived }] : [])
               ]
             );
+
+            // Credit sale: record the unpaid part in the customer's ledger (due at month-end)
+            if (creditPosted) {
+              await credit.insertLedger(client, {
+                customerId, type: 'CHARGE', amount: creditPosted.amount,
+                description: `Sale ${invoiceNumber}`, refType: 'sale', refId: saleResult.rows[0].id,
+                dueDate: credit.monthEndISO(), balanceAfter: creditPosted.balanceAfter, user
+              });
+            }
 
             await client.query('COMMIT');
 
@@ -984,8 +932,16 @@ const server = http.createServer(async (req, res) => {
           for (const item of (sale.items || [])) {
             await client.query('UPDATE products SET stock = stock + $1 WHERE id = $2', [item.quantity, item.productId]);
           }
-          if (sale.customer_id && sale.balance_due > 0) {
-            await client.query('UPDATE customers SET balance = balance - $1 WHERE id = $2', [sale.balance_due, sale.customer_id]);
+          if (sale.customer_id && parseFloat(sale.balance_due) > 0) {
+            const upd = await client.query(
+              'UPDATE customers SET balance = balance - $1 WHERE id = $2 RETURNING balance',
+              [sale.balance_due, sale.customer_id]
+            );
+            await credit.insertLedger(client, {
+              customerId: sale.customer_id, type: 'PAYMENT', amount: parseFloat(sale.balance_due),
+              description: `Sale ${sale.invoice_number} voided`, method: 'Void',
+              refType: 'sale', refId: sale.id, balanceAfter: parseFloat(upd.rows[0].balance), user
+            });
           }
           await client.query('DELETE FROM sales WHERE id = $1', [id]);
           await client.query('COMMIT');
@@ -1076,6 +1032,12 @@ const server = http.createServer(async (req, res) => {
 
           const fullName = `${user.firstName} ${user.lastName}`;
 
+          // Credit service: refuse early if it would push the customer over their credit limit
+          if (customerId && balance > 0) {
+            const limitError = await credit.checkLimit(customerId, balance);
+            if (limitError) return sendJson(res, 400, { message: limitError }, requestOrigin);
+          }
+
           try {
             const inserted = await insertWithUniqueNumber({
               table: 'services',
@@ -1112,6 +1074,13 @@ const server = http.createServer(async (req, res) => {
                 return result.rows[0];
               }
             });
+
+            // Credit service: add the unpaid part to the customer's balance + ledger
+            if (customerId && balance > 0) {
+              await credit.chargeForService({
+                customerId, amount: balance, jobNumber: inserted.job_number, serviceId: inserted.id, user
+              });
+            }
 
             sendJson(res, 201, {
               id: inserted.id, jobNumber: inserted.job_number,
@@ -1406,7 +1375,11 @@ const server = http.createServer(async (req, res) => {
 
         const receivablesResult = await query('SELECT COALESCE(SUM(balance), 0) as total FROM customers');
         const receivables = parseFloat(receivablesResult.rows[0].total);
-        const servicesOutstandingResult = await query('SELECT COALESCE(SUM(balance), 0) as total FROM services');
+        // Service credit that is already part of a customer's balance is not counted twice
+        const servicesOutstandingResult = await query(
+          `SELECT COALESCE(SUM(balance), 0) as total FROM services
+           WHERE id NOT IN (SELECT reference_id FROM customer_ledger WHERE reference_type = 'service')`
+        );
         const serviceOutstanding = parseFloat(servicesOutstandingResult.rows[0].total);
         const inventoryResult = await query('SELECT COALESCE(SUM(stock * cost_price), 0) as total FROM products');
         const inventoryValue = parseFloat(inventoryResult.rows[0].total);
@@ -1584,6 +1557,12 @@ server.listen(PORT, '0.0.0.0', async () => {
     console.log(`🗄️  Database: ✅ Connected (${result.rows[0].count} users)`);
   } catch (err) {
     console.log(`🗄️  Database: ❌ ${err.message}`);
+  }
+  try {
+    await query('SELECT 1 FROM customer_ledger LIMIT 1');
+    console.log('🧾 Customer ledger: ✅ Ready');
+  } catch (err) {
+    console.log('🧾 Customer ledger: ❌ table missing - run migration.sql');
   }
   console.log('='.repeat(50));
   console.log('✅ Server ready!');

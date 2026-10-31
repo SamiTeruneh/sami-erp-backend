@@ -1,0 +1,299 @@
+// customerCredit.js - customer credit ledger, payments and customer routes for SAMI ERP
+//
+// Drop this file next to server.js. It adds:
+//   GET   /api/v1/customers                  (now with oldestUnpaidDate, lastPurchaseDate, real totalPurchases)
+//   POST  /api/v1/customers                  (saves the opening balance + writes it to the ledger)
+//   PATCH /api/v1/customers/:id              (balance can no longer be edited directly)
+//   POST  /api/v1/customers/:id/credit       (manual credit: items/services taken on account)
+//   POST  /api/v1/customers/:id/payments     (customer pays; applied to the oldest unpaid invoices first)
+//   GET   /api/v1/customers/:id/ledger       (full history of credit and payments)
+
+const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+const num = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+
+// Last day of the current month as YYYY-MM-DD (credit is settled at month-end)
+const monthEndISO = () => {
+  const d = new Date();
+  const e = new Date(d.getFullYear(), d.getMonth() + 1, 0);
+  return new Date(e.getTime() - e.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+};
+
+// Writes one ledger row. `client` can be a pg client (inside a transaction) or the pool.
+async function insertLedger(client, e) {
+  await client.query(
+    `INSERT INTO customer_ledger
+       (customer_id, type, amount, description, method, reference_type, reference_id,
+        due_date, balance_after, created_by, created_by_name)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+    [
+      e.customerId, e.type, e.amount, e.description || null, e.method || null,
+      e.refType || null, e.refId || null, e.dueDate || null, e.balanceAfter,
+      e.user?.id || null, e.user ? `${e.user.firstName} ${e.user.lastName}` : null,
+    ]
+  );
+}
+
+function createCustomerCredit({ query, pool, checkAuth, sendJson, parseBody, insertWithUniqueNumber }) {
+  const shape = (c) => ({
+    id: c.id, customerCode: c.customer_code, name: c.name,
+    phone: c.phone, email: c.email, address: c.address,
+    balance: parseFloat(c.balance), creditLimit: parseFloat(c.credit_limit),
+    totalPurchases: parseFloat(c.purchases_total ?? c.total_purchases ?? 0),
+    lastPurchaseDate: c.last_purchase || null,
+    oldestUnpaidDate: c.oldest_unpaid || null,
+    active: c.active, createdAt: c.created_at,
+  });
+
+  // Returns an error message if adding `amount` would break the customer's credit limit, else null
+  async function checkLimit(customerId, amount) {
+    const r = await query('SELECT name, balance, credit_limit FROM customers WHERE id = $1', [customerId]);
+    const c = r.rows[0];
+    if (!c) return null;
+    const limit = num(c.credit_limit);
+    const after = round2(num(c.balance) + amount);
+    if (limit > 0 && after > limit) {
+      return `Credit limit exceeded. ${c.name} owes ETB ${num(c.balance).toFixed(2)} with a limit of ETB ${limit.toFixed(2)}; this would bring it to ETB ${after.toFixed(2)}.`;
+    }
+    return null;
+  }
+
+  // A service done on credit: add the unpaid part to the customer's balance + ledger
+  async function chargeForService({ customerId, amount, jobNumber, serviceId, user }) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const r = await client.query(
+        'UPDATE customers SET balance = balance + $1, updated_at = NOW() WHERE id = $2 RETURNING balance',
+        [amount, customerId]
+      );
+      if (r.rows[0]) {
+        await insertLedger(client, {
+          customerId, type: 'CHARGE', amount, description: `Service ${jobNumber}`,
+          refType: 'service', refId: serviceId, dueDate: monthEndISO(),
+          balanceAfter: num(r.rows[0].balance), user,
+        });
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+  }
+
+  async function handle(req, res, path, method, parsedUrl, origin) {
+    // ---------- GET /customers ----------
+    if (path === '/api/v1/customers' && method === 'GET') {
+      await checkAuth(req, res, 'customers', 'view', async () => {
+        const result = await query(`
+          SELECT c.*,
+            COALESCE((SELECT SUM(total) FROM sales s WHERE s.customer_id = c.id), 0)
+              + COALESCE((SELECT SUM(total) FROM services v WHERE v.customer_id = c.id), 0) AS purchases_total,
+            (SELECT MAX(sale_date) FROM sales s WHERE s.customer_id = c.id) AS last_purchase,
+            CASE WHEN c.balance > 0 THEN (
+              WITH paid AS (
+                SELECT COALESCE(SUM(amount), 0) AS p FROM customer_ledger
+                WHERE customer_id = c.id AND type = 'PAYMENT'
+              ),
+              ch AS (
+                SELECT created_at, SUM(amount) OVER (ORDER BY created_at, id) AS cum
+                FROM customer_ledger WHERE customer_id = c.id AND type = 'CHARGE'
+              )
+              SELECT MIN(ch.created_at) FROM ch, paid WHERE ch.cum > paid.p + 0.005
+            ) END AS oldest_unpaid
+          FROM customers c ORDER BY c.id`);
+        sendJson(res, 200, result.rows.map(shape), origin);
+      });
+      return true;
+    }
+
+    // ---------- POST /customers ----------
+    if (path === '/api/v1/customers' && method === 'POST') {
+      await checkAuth(req, res, 'customers', 'create', async (user) => {
+        parseBody(req, res, origin, async (err, body) => {
+          if (!body.name) return sendJson(res, 400, { message: 'Name required' }, origin);
+          const opening = Math.max(0, round2(num(body.openingBalance ?? body.balance)));
+          try {
+            const c = await insertWithUniqueNumber({
+              table: 'customers', column: 'customer_code', prefix: 'CUST', pad: 3, year: null,
+              buildRow: async (customerCode) => {
+                const r = await query(
+                  `INSERT INTO customers (customer_code, name, phone, email, address, balance, credit_limit, active)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+                  [customerCode, body.name, body.phone || null, body.email || null, body.address || null,
+                   opening, num(body.creditLimit), body.active !== false]
+                );
+                return r.rows[0];
+              },
+            });
+            if (opening > 0) {
+              await insertLedger(pool, {
+                customerId: c.id, type: 'CHARGE', amount: opening, description: 'Opening balance',
+                refType: 'opening', dueDate: monthEndISO(), balanceAfter: opening, user,
+              });
+            }
+            sendJson(res, 201, shape(c), origin);
+          } catch (dbError) {
+            console.error('❌ Customer INSERT failed:', dbError.message, dbError.detail);
+            sendJson(res, 500, { message: 'Failed to create customer', detail: dbError.message, code: dbError.code, constraint: dbError.constraint }, origin);
+          }
+        });
+      });
+      return true;
+    }
+
+    // ---------- PATCH /customers/:id  (no direct balance edits any more) ----------
+    if (/^\/api\/v1\/customers\/\d+$/.test(path) && method === 'PATCH') {
+      const id = parseInt(path.split('/').pop());
+      await checkAuth(req, res, 'customers', 'edit', async () => {
+        parseBody(req, res, origin, async (err, body) => {
+          const map = { name: 'name', phone: 'phone', email: 'email', address: 'address', creditLimit: 'credit_limit', active: 'active' };
+          const fields = [], values = [];
+          let idx = 1;
+          for (const [key, col] of Object.entries(map)) {
+            if (body[key] !== undefined) { fields.push(`${col} = $${idx++}`); values.push(body[key]); }
+          }
+          if (fields.length === 0) return sendJson(res, 400, { message: 'No fields' }, origin);
+          fields.push('updated_at = NOW()');
+          values.push(id);
+          const r = await query(`UPDATE customers SET ${fields.join(', ')} WHERE id = $${idx} RETURNING *`, values);
+          if (r.rows.length === 0) return sendJson(res, 404, { message: 'Not found' }, origin);
+          sendJson(res, 200, shape(r.rows[0]), origin);
+        });
+      });
+      return true;
+    }
+
+    // ---------- POST /customers/:id/credit ----------
+    let m = path.match(/^\/api\/v1\/customers\/(\d+)\/credit$/);
+    if (m && method === 'POST') {
+      const id = parseInt(m[1]);
+      await checkAuth(req, res, 'customers', 'edit', async (user) => {
+        parseBody(req, res, origin, async (err, body) => {
+          const amount = round2(num(body.amount));
+          if (amount <= 0) return sendJson(res, 400, { message: 'Amount must be greater than 0' }, origin);
+          const client = await pool.connect();
+          try {
+            await client.query('BEGIN');
+            const r = await client.query('SELECT * FROM customers WHERE id = $1 FOR UPDATE', [id]);
+            const c = r.rows[0];
+            if (!c) { await client.query('ROLLBACK'); return sendJson(res, 404, { message: 'Customer not found' }, origin); }
+            if (!c.active) { await client.query('ROLLBACK'); return sendJson(res, 400, { message: 'Customer is inactive' }, origin); }
+            const limit = num(c.credit_limit);
+            const after = round2(num(c.balance) + amount);
+            if (limit > 0 && after > limit) {
+              await client.query('ROLLBACK');
+              return sendJson(res, 400, { message: `Credit limit exceeded. ${c.name} would owe ETB ${after.toFixed(2)} (limit ETB ${limit.toFixed(2)}).` }, origin);
+            }
+            await client.query('UPDATE customers SET balance = $1, updated_at = NOW() WHERE id = $2', [after, id]);
+            await insertLedger(client, {
+              customerId: id, type: 'CHARGE', amount, description: body.description || 'Credit',
+              refType: 'manual', dueDate: body.dueDate || monthEndISO(), balanceAfter: after, user,
+            });
+            await client.query('COMMIT');
+            sendJson(res, 201, { balance: after }, origin);
+          } catch (e) {
+            await client.query('ROLLBACK');
+            throw e;
+          } finally {
+            client.release();
+          }
+        });
+      });
+      return true;
+    }
+
+    // ---------- POST /customers/:id/payments ----------
+    m = path.match(/^\/api\/v1\/customers\/(\d+)\/payments$/);
+    if (m && method === 'POST') {
+      const id = parseInt(m[1]);
+      await checkAuth(req, res, 'customers', 'create', async (user) => {
+        parseBody(req, res, origin, async (err, body) => {
+          const amount = round2(num(body.amount));
+          if (amount <= 0) return sendJson(res, 400, { message: 'Amount must be greater than 0' }, origin);
+          const client = await pool.connect();
+          try {
+            await client.query('BEGIN');
+            const r = await client.query('SELECT * FROM customers WHERE id = $1 FOR UPDATE', [id]);
+            const c = r.rows[0];
+            if (!c) { await client.query('ROLLBACK'); return sendJson(res, 404, { message: 'Customer not found' }, origin); }
+            const balance = num(c.balance);
+            if (amount > balance + 0.005) {
+              await client.query('ROLLBACK');
+              return sendJson(res, 400, { message: `Payment is more than the outstanding balance (ETB ${balance.toFixed(2)})` }, origin);
+            }
+
+            // Apply the payment to the oldest unpaid invoices / jobs first
+            const sales = (await client.query(
+              `SELECT id, balance_due AS due, sale_date AS dt FROM sales
+               WHERE customer_id = $1 AND balance_due > 0
+                 AND id IN (SELECT reference_id FROM customer_ledger WHERE customer_id = $1 AND reference_type = 'sale')
+               ORDER BY sale_date, id FOR UPDATE`, [id])).rows.map((x) => ({ ...x, kind: 'sale' }));
+            const services = (await client.query(
+              `SELECT id, balance AS due, received_date AS dt FROM services
+               WHERE customer_id = $1 AND balance > 0
+                 AND id IN (SELECT reference_id FROM customer_ledger WHERE customer_id = $1 AND reference_type = 'service')
+               ORDER BY received_date, id FOR UPDATE`, [id])).rows.map((x) => ({ ...x, kind: 'service' }));
+
+            let left = amount;
+            for (const item of [...sales, ...services].sort((a, b) => new Date(a.dt) - new Date(b.dt))) {
+              if (left <= 0.004) break;
+              const take = round2(Math.min(num(item.due), left));
+              if (take <= 0) continue;
+              if (item.kind === 'sale') {
+                await client.query(
+                  `UPDATE sales SET amount_paid = amount_paid + $1::numeric, balance_due = balance_due - $1::numeric,
+                     payment_status = CASE WHEN balance_due - $1::numeric <= 0.005 THEN 'Paid' ELSE 'Partial' END,
+                     status = CASE WHEN balance_due - $1::numeric <= 0.005 THEN 'Completed' ELSE status END
+                   WHERE id = $2`, [take, item.id]);
+              } else {
+                await client.query(
+                  `UPDATE services SET amount_paid = amount_paid + $1::numeric, balance = balance - $1::numeric, updated_at = NOW()
+                   WHERE id = $2`, [take, item.id]);
+              }
+              left = round2(left - take);
+            }
+
+            const after = round2(balance - amount);
+            await client.query('UPDATE customers SET balance = $1, updated_at = NOW() WHERE id = $2', [after, id]);
+            await insertLedger(client, {
+              customerId: id, type: 'PAYMENT', amount, description: body.description || 'Payment received',
+              method: body.method || 'Cash', refType: 'manual', balanceAfter: after, user,
+            });
+            await client.query('COMMIT');
+            sendJson(res, 201, { balance: after }, origin);
+          } catch (e) {
+            await client.query('ROLLBACK');
+            throw e;
+          } finally {
+            client.release();
+          }
+        });
+      });
+      return true;
+    }
+
+    // ---------- GET /customers/:id/ledger ----------
+    m = path.match(/^\/api\/v1\/customers\/(\d+)\/ledger$/);
+    if (m && method === 'GET') {
+      const id = parseInt(m[1]);
+      await checkAuth(req, res, 'customers', 'view', async () => {
+        const r = await query(
+          'SELECT * FROM customer_ledger WHERE customer_id = $1 ORDER BY created_at DESC, id DESC', [id]);
+        sendJson(res, 200, r.rows.map((e) => ({
+          id: e.id, type: e.type, amount: parseFloat(e.amount), description: e.description,
+          method: e.method, date: e.created_at, dueDate: e.due_date,
+          balanceAfter: e.balance_after === null ? undefined : parseFloat(e.balance_after),
+        })), origin);
+      });
+      return true;
+    }
+
+    return false; // not one of ours - let server.js continue
+  }
+
+  return { handle, checkLimit, chargeForService, insertLedger, monthEndISO };
+}
+
+module.exports = { createCustomerCredit };
